@@ -57,6 +57,10 @@ def run_cmd(cmd, capture_output=True, check=True, env=None):
 # --------------------------- Operation 1: Docker Execution ---------------------------
 
 
+from pathlib import Path
+from typing import Any, Dict
+import subprocess
+
 def operation_docker(
         task_id: str,
         docker_tar: str,
@@ -67,147 +71,201 @@ def operation_docker(
         keep_container: bool = False,
 ) -> Dict[str, Any]:
     """
-    Performs docker load, run, copy .git into container, exec entrypoint,
-    capture logs.
-
-    Returns a dict with keys: container_id, log_file_path, success(bool), error
+    Performs docker load, run, copy .git into container, execute entrypoint,
+    and capture logs. Separates logs into multiple files based on section markers.
     """
     out = {"container_id": None, "log_file_path": None, "success": False, "error": None}
+
     try:
-        # 1) Load image
+        # ----------------------------
+        # 1) Load Docker image
+        # ----------------------------
         print(f"[docker] Loading image from: {docker_tar}")
-        p = run_cmd(["docker", "load", "-i", docker_tar])
-        # docker load prints something like: "Loaded image: <name:tag>" or
-        # "sha256:<hash>"
+        p = subprocess.run(["docker", "load", "-i", docker_tar], capture_output=True, text=True, check=True)
         stdout = p.stdout or ""
         print("[docker] load output:\n", stdout)
 
-        # Try to extract an image reference (name:tag or digest) - fallback to 'latest'
+        # Extract image reference
         image_ref = None
         for line in stdout.splitlines():
             if "Loaded image:" in line:
                 image_ref = line.split("Loaded image:", 1)[1].strip()
                 break
         if not image_ref:
-            # try to parse 'sha256:' digest
+            # fallback: use digest or most recent image
             for line in stdout.splitlines():
                 if line.startswith("sha256:"):
                     image_ref = line.strip()
                     break
         if not image_ref:
-            # final fallback: list images and take the most recent
-            p2 = run_cmd(["docker", "images", "--format", "{{.Repository}}:{{.Tag}} {{.CreatedAt}}"], check=False)
-            lines = (p2.stdout or "").strip().splitlines()
-            if lines:
-                # choose the first non-<none>
-                for l in lines:
-                    if "<none>" not in l:
-                        image_ref = l.split()[0]
-                        break
+            images = subprocess.run(
+                ["docker", "images", "--format", "{{.Repository}}:{{.Tag}} {{.CreatedAt}}"],
+                capture_output=True, text=True
+            )
+            for l in (images.stdout or "").splitlines():
+                if "<none>" not in l:
+                    image_ref = l.split()[0]
+                    break
         if not image_ref:
             raise RuntimeError("Could not determine image reference after docker load")
 
         print(f"[docker] Image reference resolved to: {image_ref}")
 
-        # 2) Run container in detached mode and keep it alive with `tail -f /dev/null`
-        print("[docker] Starting container (detached)...")
-        completed = run_cmd(["docker", "run", "-d", image_ref, "tail", "-f", "/dev/null"])
-        container_id = (completed.stdout or "").strip().splitlines()[0]
+        # ----------------------------
+        # 2) Run container detached
+        # ----------------------------
+        completed = subprocess.run(["docker", "run", "-d", image_ref, "tail", "-f", "/dev/null"],
+                                   capture_output=True, text=True, check=True)
+        container_id = completed.stdout.strip().splitlines()[0]
         if not container_id:
             raise RuntimeError("docker run did not return a container id")
         out["container_id"] = container_id
-        print(f"[docker] container started: {container_id}")
+        print(f"[docker] Container started: {container_id}")
 
-        # 3) Copy .git folder into container:/app/.git
-        print(f"[docker] Copying .git from {local_git_folder} into container:/app")
-        # Ensure provided path points to a .git folder (or directory containing .git)
+        # ----------------------------
+        # 3) Copy .git and entrypoint.sh
+        # ----------------------------
         src = Path(local_git_folder)
         if src.is_dir() and src.name == ".git":
             src_path = str(src)
         elif src.is_dir() and (src / ".git").exists():
             src_path = str(src / ".git")
         else:
-            raise RuntimeError(f"Provided local git folder not found or not a .git: {local_git_folder}")
+            raise RuntimeError(f"Local git folder not found or invalid: {local_git_folder}")
+
         project_root = Path(__file__).parent.parent
+        entrypoint_src = str(project_root / "entrypoint" / "entrypoint.sh")
 
-        # Path to entrypoint.sh
-        entrypoint_src = project_root / "entrypoint" / "entrypoint.sh"
+        subprocess.run(["docker", "cp", src_path, f"{container_id}:/app/"], check=True)
+        subprocess.run(["docker", "cp", entrypoint_src, f"{container_id}:/app/entrypoint.sh"], check=True)
 
-        # Convert to string if needed
-        entrypoint_src = str(entrypoint_src)
-
-        run_cmd(["docker", "cp", src_path, f"{container_id}:/app/"])
-        print("[docker] .git copied into container:/app")
-        run_cmd(["docker", "cp", entrypoint_src, f"{container_id}:/app/entrypoint.sh"])
-        print("[docker] entrypoint.sh copied into container:/app/")
-
-        # 4) Execute entrypoint.sh inside container with environment variables
-        # Build env vars list for docker exec
+        # ----------------------------
+        # 4) Execute entrypoint.sh
+        # ----------------------------
         env_vars = entrypoint_args.copy()
         env_vars["runCommand"] = run_command
 
         exec_cmd = ["docker", "exec", "-i"]
-
-        # Add environment variables
         for k, v in env_vars.items():
             exec_cmd += ["-e", f"{k}={v}"]
 
-        # Full chained command with logging and error handling
         bash_command = (
             "set -euo pipefail;"
-            "echo '--- Checking if /app/entrypoint.sh exists ---';"
-            "if [ ! -f /app/entrypoint.sh ]; then echo 'Error: /app/entrypoint.sh not found' >&2; exit 128; fi;"
-            "echo '--- Normalizing line endings ---';"
+            "echo '--- Checking entrypoint.sh ---';"
+            "if [ ! -f /app/entrypoint.sh ]; then echo 'Error: entrypoint.sh not found' >&2; exit 128; fi;"
             "sed -i 's/\\r$//' /app/entrypoint.sh;"
-            "echo '--- Making executable ---';"
             "chmod +x /app/entrypoint.sh;"
-            "echo '--- Running entrypoint.sh ---';"
             "bash /app/entrypoint.sh"
         )
-
         exec_cmd += [container_id, "/bin/bash", "-lc", bash_command]
 
-        print("[docker] Executing entrypoint.sh inside container... (this may take time)")
-
-        # Open log file and stream output
         logs_path = Path(logs_outpath)
         logs_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Section markers
+        SECTIONS = {
+            "commit_chain": ("COMMIT CHAIN HISTORY", "END OF COMMIT CHAIN HISTORY"),
+            "file_changes": ("FILE CHANGES AND PII SUMMARY", "END OF FILE CHANGES AND PII SUMMARY"),
+            "qp1_execution": ("QUERY POINT SET 1 - TEST COMMIT CHECK", None),
+            "qp2_execution": ("QUERY POINT SET 2 - TEST COMMIT CHECK", None),
+            "qp3_execution": ("QUERY POINT SET 3 - TEST COMMIT CHECK", None),
+        }
+
+        # Buffers
+        buffers = {k: [] for k in SECTIONS}
+
+        # Active section tracker
+        active_section = None
+
         with open(logs_path, "w", encoding="utf-8") as lf:
-            proc = subprocess.Popen(exec_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            # stream to logfile
+            proc = subprocess.Popen(
+                exec_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+
             for line in proc.stdout:
+                line = line.replace('â""', '└').replace('â"€', '─').replace('Ã¢Å"â€¦', '✅')
+                line = line.replace('â€â€', '  ').replace('â€â‚¬', '─')
                 lf.write(line)
                 lf.flush()
+                stripped_line = line.rstrip()
+
+                # Section detection
+                for key, (start_marker, end_marker) in SECTIONS.items():
+                    if start_marker in line:
+                        active_section = key
+                        buffers[key].append(stripped_line)
+                        break
+                    if end_marker and end_marker in line and active_section == key:
+                        buffers[key].append(stripped_line)
+                        active_section = None
+                        break
+                else:
+                    if active_section:
+                        buffers[active_section].append(stripped_line)
+
             ret = proc.wait()
             if ret != 0:
                 raise RuntimeError(f"entrypoint.sh returned non-zero exit: {ret}")
 
+        # Write individual section logs
+        log_files = {}
+        for key in SECTIONS:
+            buf = buffers[key]
+            if buf:
+                file_path = logs_path.parent / "execution" / f"{key}.log"
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(buf))
+                log_files[key] = str(file_path)
+                print(f"✅ Created: {file_path}")
+            else:
+                log_files[key] = None
+
         out["log_file_path"] = str(logs_path)
+        out["log_files"] = {"main": str(logs_path), **log_files}
         out["success"] = True
 
-        patch_root = Path(__file__).parent.parent
+        # ----------------------------
+        # 5) Copy patch folder (if exists)
+        # ----------------------------
+        patch_dest = project_root / "output" / task_id / "patch"
+        patch_dest.mkdir(parents=True, exist_ok=True)
+        patch_dest_str = str(patch_dest)
 
-        patch_src = patch_root / "output" / task_id
+        check_cmd = ["docker", "exec", container_id, "test", "-d", "/app/patch"]
+        check_result = subprocess.run(check_cmd, check=False)
+        if check_result.returncode == 0:
+            subprocess.run(["docker", "cp", f"{container_id}:/app/patch/.", patch_dest_str], check=True)
+            print(f"[docker] Patch copied to {patch_dest_str}")
+        else:
+            print("[docker] /app/patch directory not found, skipping copy")
 
-        # Convert to string
-        patch_src = str(patch_src)
-
-        print(f"[docker] patch copying {container_id} {patch_src}")
-
-        run_cmd(["docker", "cp", f"{container_id}:/app/patch", f"{patch_src}"])
-
-        print(f"[docker] patch copied {container_id} {patch_src}")
-
+        # ----------------------------
+        # 6) Cleanup
+        # ----------------------------
         if not keep_container:
-            # stop & remove container
-            run_cmd(["docker", "stop", container_id])
-            run_cmd(["docker", "rm", container_id])
-            run_cmd(["docker", "rmi", image_ref])
+            subprocess.run(["docker", "stop", container_id], check=False)
+            subprocess.run(["docker", "rm", container_id], check=False)
+            subprocess.run(["docker", "rmi", image_ref], check=False)
+            print("[docker] Container and image removed")
+
         print(f"[docker] Completed operation, logs written to: {logs_path}")
+
     except Exception as e:
         out["error"] = str(e)
         print("[docker] ERROR:", e)
+        if out["container_id"] and not keep_container:
+            try:
+                subprocess.run(["docker", "stop", out["container_id"]], check=False)
+                subprocess.run(["docker", "rm", out["container_id"]], check=False)
+            except:
+                pass
+
     return out
 
 
@@ -383,7 +441,8 @@ def operation_gemini_evaluate(
 
         # Save the updated CSV
         out_checklist_path.mkdir(parents=True, exist_ok=True)
-        output_path = out_checklist_path / "llm_evaluation.csv"
+        output_path = out_checklist_path / "llm" / "llm_evaluation.csv"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         review_checklist_df.to_csv(output_path, index=False)
 
         result["success"] = True
@@ -552,7 +611,7 @@ def orchestrate(args):
     }
 
     project_root = Path(__file__).parent.parent
-    docker_log_path = logs_dir / f"{args.task_id}_output_log.txt"
+    docker_log_path = logs_dir / f"{args.task_id}_overall_log.txt"
     checklist_out_xlsx = logs_dir
 
     docker_result = {}

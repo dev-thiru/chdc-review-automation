@@ -78,9 +78,22 @@ The execution results will be generated in the `outputs` folder, containing:
 ```
 /outputs
   └── 858201
-      ├── patch/
-      ├── 858201_output_log.txt
-      └── llm_evaluation.csv
+      ├── execution
+            ├── commit_chain.log
+            ├── file_changes.log
+            ├── qp1_execution.log
+            ├── qp2_execution.log
+            └── qp3_execution.log
+      ├── llm
+            └── llm_evaluation.csv
+      ├── patch
+            ├── gold_code_1.patch
+            ├── gold_code_2.patch
+            ├── gold_code_3.patch
+            ├── gold_test_1.patch
+            ├── gold_test_2.patch
+            └── gold_test_3.patch
+      └── 858201_overall_log.txt
 ```
 
 ## Functionality Verified

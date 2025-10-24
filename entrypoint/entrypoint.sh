@@ -40,6 +40,13 @@ mkdir -p "$PATCH_DIR"
 echo "[ENTRYPOINT] Using logs path: $LOGS_PATH"
 echo "[ENTRYPOINT] Using patch path: $PATCH_DIR"
 
+# --- Define log file paths ---
+COMMIT_CHAIN_LOG="$LOGS_PATH/1_commit_chain_history.log"
+FILE_CHANGES_LOG="$LOGS_PATH/2_file_changes_pii_summary.log"
+QP1_EXECUTION_LOG="$LOGS_PATH/3_qp1_execution.log"
+QP2_EXECUTION_LOG="$LOGS_PATH/4_qp2_execution.log"
+QP3_EXECUTION_LOG="$LOGS_PATH/5_qp3_execution.log"
+
 # --- PYTHON SCRIPT TO GENERATE run_test.sh ---
 cat <<'EOF' > generate_test_script.py
 import argparse, os
@@ -47,6 +54,7 @@ import argparse, os
 BASH_HEADER = "#!/bin/bash\nset -euo pipefail\n\n"
 
 BLOCK_TEMPLATE = """
+{{
 echo ""
 echo "================= QUERY POINT SET {index} - TEST COMMIT CHECK ================="
 
@@ -76,6 +84,7 @@ echo "Running test for PATCH SET {index} - CODE + TEST COMMIT CHECK"
 safe_git_apply "$PATCH_DIR/gold_code_{index}.patch" "CODE PATCH {index}"
 safe_git_apply "$PATCH_DIR/gold_test_{index}.patch" "TEST PATCH after CODE {index}"
 {test_command} || true
+}} 2>&1 | tee "{log_file}"
 """
 
 def main():
@@ -93,6 +102,7 @@ def main():
     args = parser.parse_args()
 
     PATCH_DIR = os.environ.get("PATCH_DIR", "/app/patch")
+    LOGS_PATH = os.environ.get("LOGS_PATH", "/tmp/logs")
     os.makedirs(PATCH_DIR, exist_ok=True)
 
     script = BASH_HEADER
@@ -111,12 +121,14 @@ def main():
 
     for idx, base, code, test in sets:
         if base and code and test:
+            log_file = f"{LOGS_PATH}/{idx + 2}_qp{idx}_execution.log"
             script += BLOCK_TEMPLATE.format(
                 index=idx,
                 base=base,
                 code=code,
                 test=test,
                 test_command=args.test_command,
+                log_file=log_file,
             )
 
     with open("run_test.sh", "w") as f:
@@ -137,90 +149,99 @@ python3 generate_test_script.py \
   ${QP3_USER_TURN:+--base3 "$QP3_USER_TURN"} ${QP3_AGENT_TURN:+--code3 "$QP3_AGENT_TURN"} ${QP3_TEST:+--test3 "$QP3_TEST"} \
   --test_command "$TEST_COMMAND"
 
-# --- Collect commit history (max depth 4) ---
+# --- Collect commit history (max depth 5) ---
 commit_vars=( \
   "QP1_USER_TURN:$QP1_USER_TURN" "QP1_AGENT_TURN:$QP1_AGENT_TURN" "QP1_TEST:$QP1_TEST" \
   "QP2_USER_TURN:$QP2_USER_TURN" "QP2_AGENT_TURN:$QP2_AGENT_TURN" "QP2_TEST:$QP2_TEST" \
   "QP3_USER_TURN:$QP3_USER_TURN" "QP3_AGENT_TURN:$QP3_AGENT_TURN" "QP3_TEST:$QP3_TEST" \
 )
 
-commit_chains_file="$LOGS_PATH/commit_chains.txt"
-: > "$commit_chains_file"
-echo "[ENTRYPOINT] Commit chain summary started."  >> "$commit_chains_file"
-echo "[ENTRYPOINT] ======================================================================"  >> "$commit_chains_file"
-echo "[ENTRYPOINT] Writing commit chains (depth 4) to $commit_chains_file"
-for entry in "${commit_vars[@]}"; do
-    name="${entry%%:*}"
-    sha="${entry#*:}"
+# --- Generate 1. Commit Chain History ---
+echo "[ENTRYPOINT] Writing commit chain history to $COMMIT_CHAIN_LOG"
+{
+    echo "======================================================================"
+    echo "COMMIT CHAIN HISTORY"
+    echo "Generated at: $(date)"
+    echo "======================================================================"
+    echo ""
 
-    [[ -z "$sha" ]] && continue
+    for entry in "${commit_vars[@]}"; do
+        name="${entry%%:*}"
+        sha="${entry#*:}"
 
-    if ! git rev-parse --verify --quiet "$sha" >/dev/null; then
-        echo "$name -> (invalid ref: $sha)" >> "$commit_chains_file"
-        continue
-    fi
+        [[ -z "$sha" ]] && continue
 
-    echo "$name:" >> "$commit_chains_file"
+        if ! git rev-parse --verify --quiet "$sha" >/dev/null; then
+            echo "$name -> (invalid ref: $sha)"
+            continue
+        fi
 
-    # Get the last 4 commits in parent history, oldest first
-    mapfile -t commits < <(git rev-list --max-count=5 --reverse "$sha")
+        echo "$name:"
 
-    # Reverse the array so latest commit is at top
-    for ((i=${#commits[@]}-1; i>=0; i--)); do
-        commit="${commits[i]}"
-        msg=$(git log -1 --pretty=format:"%H - %s" "$commit")
+        # Get the last 5 commits in parent history, oldest first
+        mapfile -t commits < <(git rev-list --max-count=5 --reverse "$sha")
 
-        # Indentation: depth from the last commit
-        depth=$(( ${#commits[@]} - 1 - i ))
-        indent=""
-        for ((d=0; d<depth; d++)); do
-            indent+="  └─ "
+        # Reverse the array so latest commit is at top
+        for ((i=${#commits[@]}-1; i>=0; i--)); do
+            commit="${commits[i]}"
+            msg=$(git log -1 --pretty=format:"%H - %s" "$commit")
+
+            # Indentation: depth from the last commit
+            depth=$(( ${#commits[@]} - 1 - i ))
+            indent=""
+            for ((d=0; d<depth; d++)); do
+                indent+="  └─ "
+            done
+
+            echo "${indent}${msg}"
         done
 
-        echo "${indent}${msg}" >> "$commit_chains_file"
+        echo ""
     done
 
-    echo "" >> "$commit_chains_file"
-done
+    echo "======================================================================"
+    echo "END OF COMMIT CHAIN HISTORY"
+    echo "======================================================================"
+} > "$COMMIT_CHAIN_LOG"
 
+cat "$COMMIT_CHAIN_LOG"
 
+# --- Generate 2. File Changes and PII Summary ---
+echo "[ENTRYPOINT] Writing file changes and PII summary to $FILE_CHANGES_LOG"
+{
+    echo "======================================================================"
+    echo "FILE CHANGES AND PII SUMMARY"
+    echo "Generated at: $(date)"
+    echo "======================================================================"
+    echo ""
 
+    for entry in "${commit_vars[@]}"; do
+        name="${entry%%:*}"
+        sha="${entry#*:}"
 
-echo "[ENTRYPOINT] Commit chain summary written."  >> "$commit_chains_file"
-echo "[ENTRYPOINT] ======================================================================"  >> "$commit_chains_file"
+        # Skip if sha is empty
+        [[ -z "$sha" ]] && continue
 
-echo "[ENTRYPOINT] File Changes Verification and PII summary."  >> "$commit_chains_file"
-echo "[ENTRYPOINT] ======================================================================"  >> "$commit_chains_file"
+        # Verify commit SHA exists
+        if ! git rev-parse --verify --quiet "$sha" >/dev/null; then
+            echo "$name -> (invalid ref: $sha)"
+            continue
+        fi
 
+        # Fetch author and committer details for the given commit only
+        author_name=$(git show -s --format='%an' "$sha")
+        author_email=$(git show -s --format='%ae' "$sha")
+        committer_name=$(git show -s --format='%cn' "$sha")
+        committer_email=$(git show -s --format='%ce' "$sha")
 
-for entry in "${commit_vars[@]}"; do
-    name="${entry%%:*}"
-    sha="${entry#*:}"
+        # Fetch list of files with their status (A=Added, M=Modified, D=Deleted)
+        mapfile -t changed_files < <(git show --pretty="" --name-status "$sha")
 
-    # Skip if sha is empty
-    [[ -z "$sha" ]] && continue
-
-    # Verify commit SHA exists
-    if ! git rev-parse --verify --quiet "$sha" >/dev/null; then
-        echo "$name -> (invalid ref: $sha)" >> "$commit_chains_file"
-        continue
-    fi
-
-    # Fetch author and committer details for the given commit only
-    author_name=$(git show -s --format='%an' "$sha")
-    author_email=$(git show -s --format='%ae' "$sha")
-    committer_name=$(git show -s --format='%cn' "$sha")
-    committer_email=$(git show -s --format='%ce' "$sha")
-
-    # Fetch list of files with their status (A=Added, M=Modified, D=Deleted)
-    mapfile -t changed_files < <(git show --pretty="" --name-status "$sha")
-
-    # Write to output file
-    {
         echo "$name ->"
         echo "  Commit: $sha"
         echo "  Author:    $author_name <$author_email>"
         echo "  Committer: $committer_name <$committer_email>"
+
         if [[ ${#changed_files[@]} -gt 0 ]]; then
             echo "  Files Changed:"
             for line in "${changed_files[@]}"; do
@@ -240,16 +261,37 @@ for entry in "${commit_vars[@]}"; do
             echo "  Files Changed: (none)"
         fi
         echo ""
-    } >> "$commit_chains_file"
-done
+    done
 
-echo "[ENTRYPOINT] File Changes Verification and PII summary completed."  >> "$commit_chains_file"
-echo "[ENTRYPOINT] ======================================================================"  >> "$commit_chains_file"
+    echo "======================================================================"
+    echo "END OF FILE CHANGES AND PII SUMMARY"
+    echo "======================================================================"
+} > "$FILE_CHANGES_LOG"
 
-cat "$commit_chains_file"
+cat "$FILE_CHANGES_LOG"
 
-# --- Execute tests ---
+# --- Execute tests (logs are automatically redirected by run_test.sh) ---
+echo ""
 echo "[ENTRYPOINT] Running generated script..."
-bash -x ./run_test.sh || echo "[ENTRYPOINT] Completed with warnings, check above logs"
+echo "[ENTRYPOINT] QP execution logs will be written to:"
+[[ -n "$QP1_USER_TURN" ]] && echo "  - $QP1_EXECUTION_LOG"
+[[ -n "$QP2_USER_TURN" ]] && echo "  - $QP2_EXECUTION_LOG"
+[[ -n "$QP3_USER_TURN" ]] && echo "  - $QP3_EXECUTION_LOG"
+echo ""
 
+bash ./run_test.sh || echo "[ENTRYPOINT] Completed with warnings, check logs"
+
+echo ""
+echo "[ENTRYPOINT] ======================================================================"
+echo "[ENTRYPOINT] Execution Summary"
+echo "[ENTRYPOINT] ======================================================================"
+echo "[ENTRYPOINT] All logs have been written to: $LOGS_PATH"
+echo "[ENTRYPOINT]"
+echo "[ENTRYPOINT]   1. Commit Chain History:        $COMMIT_CHAIN_LOG"
+echo "[ENTRYPOINT]   2. File Changes & PII Summary:  $FILE_CHANGES_LOG"
+[[ -n "$QP1_USER_TURN" ]] && echo "[ENTRYPOINT]   3. QP1 Execution:               $QP1_EXECUTION_LOG"
+[[ -n "$QP2_USER_TURN" ]] && echo "[ENTRYPOINT]   4. QP2 Execution:               $QP2_EXECUTION_LOG"
+[[ -n "$QP3_USER_TURN" ]] && echo "[ENTRYPOINT]   5. QP3 Execution:               $QP3_EXECUTION_LOG"
+echo "[ENTRYPOINT]"
+echo "[ENTRYPOINT] ======================================================================"
 echo "[ENTRYPOINT] Finished execution ✅"
