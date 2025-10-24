@@ -9,9 +9,8 @@ Before you begin, ensure you have the following installed:
 - **Python 3** (modern version recommended)
 - **Docker Desktop** (installed and running)
 
-## Installation
 
-### 1. Set Up Python Virtual Environment
+### Set Up Python Virtual Environment
 
 Install all required dependencies from the `requirements.txt` file:
 
@@ -29,34 +28,11 @@ venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Start Docker Desktop
+### Start Docker Desktop
 
 Ensure Docker Desktop is running before executing the script.
 
-## Setup
-
-### Prepare Input Files
-
-1. **Download the required files:**
-    - `.tar` file
-    - Instance ID `.zip` folder , download the complete folder of that specific task 
-
-2. **Create a folder structure:**
-    - Create a folder named with your task ID
-    - Place both the `.tar` file and `.zip` file inside this folder
-
-3. **Move to input directory:**
-    - Place the task folder in the `/input` directory
-
-**Example structure:**
-```
-/input
-  └── 858201
-      ├── docker_image.tar
-      └── instance_id.zip
-```
-
-## Usage
+### Execute
 
 Run the script with the task ID flag:
 
@@ -66,7 +42,24 @@ python chdc_review_generator.py --task_id=858201
 
 Replace `858201` with your specific task ID.
 
-## Output
+### Google Authentication
+
+All tasks require manual Google Drive authentication for file access. Follow these steps:
+
+**Login with your Google account** 
+
+Enter your username and password when prompted.
+
+**Click "Download Anyway"** manually to download .tar when that tab gets opened in the browser
+![Alt Text](/config/images/tar_file.png)
+
+
+**Click "Download"** manually to download git folder when that gets opened in the browser
+
+![Alt Text](/config/images/git_folder.png)
+
+
+### Output
 
 The execution results will be generated in the `outputs` folder, containing:
 
