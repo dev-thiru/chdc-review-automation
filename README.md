@@ -1,4 +1,4 @@
-# CHDC Review Generator
+# CHDC Review Automation
 
 A Python-based tool for generating code reviews using Docker containerization and LLM evaluation.
 
@@ -78,10 +78,24 @@ The execution results will be generated in the `outputs` folder, containing:
 ```
 /outputs
   └── 858201
-      ├── patches/
-      ├── docker_execution.log
-      └── llm_evaluation.log
+      ├── patch/
+      ├── 858201_output_log.txt
+      └── llm_evaluation.csv
 ```
+
+## Functionality Verified
+
+
+This script performs the following verification steps:
+
+- **Environment Setup**: Validates the repository structure and Git configuration at `/app`
+- **Commit Chain Verification**: Traces and documents the ancestry of up to 5 commits for each query point (QP1, QP2, QP3)
+- **Patch Generation**: Creates separate code and test patches for each query point set
+- **Test-Only Validation**: Applies test patches independently and runs test commands to verify test integrity
+- **Code + Test Integration**: Applies both code and test patches sequentially to validate the complete implementation
+- **File Change Tracking**: Logs all modified, added, deleted, renamed, or copied files for each commit
+- **PII Detection**: Records author and committer information (name and email) for compliance and audit purposes
+- **Automated Test Execution**: Runs configurable test commands after each patch application phase
 
 ## Troubleshooting
 

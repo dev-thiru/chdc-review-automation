@@ -9,3 +9,6 @@ __pycache__/
 # Optional: Ignore virtual environment folder if any
 venv/
 env/
+input/
+output/
+batches/
