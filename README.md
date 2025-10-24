@@ -78,7 +78,7 @@ The execution results will be generated in the `outputs` folder, containing:
 
 ```
 /outputs
-└── 858201
+  └── 858201
     ├── execution
     │   ├── commit_chain.log
     │   ├── file_changes.log
