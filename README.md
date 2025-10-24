@@ -1,6 +1,6 @@
 # CHDC Review Automation
 
-A Python-based tool for generating code reviews using Docker containerization and LLM evaluation.
+A Python-based tool for generating task reviews using Docker containerization and LLM evaluation.
 
 ## Prerequisites
 
