@@ -2,6 +2,8 @@
 """
 Configuration file for CHDC Review Automation
 """
+import shutil
+from pathlib import Path
 
 # Google Sheets Configuration
 SHEET_ID = "1e3_JmLRWZVma5QxdPEqcRR3LI5SZcV_bYo7I4RXCxas"
@@ -9,7 +11,6 @@ CONFIG_SHEET_NAME = "533003217"
 REVIEW_SHEET_NAME = "483459467"
 CONFIGURATION_COL = ["LT_User_Token"]
 GEMINI_TOKEN = ["LLM_API_Token"]
-
 
 # Directory Configuration
 DOWNLOAD_DIR = "batches"
@@ -130,6 +131,7 @@ COLUMNS_ORDER = [
     'Prompts for which the agent changes are rejected'
 ]
 
+
 def find_col(df, possible_names):
     """Return actual column name in df matching any of possible_names (case-insensitive)."""
     if df is None or df.columns is None:
@@ -139,3 +141,14 @@ def find_col(df, possible_names):
         if n and n.lower() in m:
             return m[n.lower()]
     return None
+
+
+def delete_folder(folder_path):
+    folder_path = Path(folder_path)  # Ensure it's a Path object
+    if folder_path.exists() and folder_path.is_dir():
+        shutil.rmtree(folder_path)
+        print(f"Folder '{folder_path}' has been deleted successfully.")
+        return True
+    else:
+        print(f"Folder '{folder_path}' does not exist.")
+        return False

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from drive.drive_downloader import download_from_drive
 from executor.automation_executor import automation_executor
 
 
@@ -47,14 +48,25 @@ def read_commits_from_csv(csv_path):
     }
 
 
+def download_files(csv_path, base_dir):
+    input_df = pd.read_csv(csv_path)
+    tar_link = input_df.iloc[0].get("Path to Docker .tar".strip(), None)
+    git_folder_link = input_df.iloc[0].get(".git file link".strip(), None)
+    download_from_drive(tar_link, base_dir)
+    download_from_drive(git_folder_link, base_dir)
+    pass
+
+
 def review_executor(task_id):
     project_root = Path(__file__).parent.parent
     base_dir = project_root / "input" / f"{task_id}"
+
     # auto-discover input files
+
+    csv_path = find_file_with_extension(base_dir, ".csv")
+    download_files(csv_path, base_dir)
     tar_path = find_file_with_extension(base_dir, ".tar")
     zip_path = find_file_with_extension(base_dir, ".zip")
-    csv_path = find_file_with_extension(base_dir, ".csv")
-
     local_git_path = extract_zip_and_find_git(zip_path)
     commit_data = read_commits_from_csv(csv_path)
 

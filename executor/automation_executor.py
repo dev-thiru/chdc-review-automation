@@ -341,6 +341,7 @@ def get_gemini_api_token():
 def operation_gemini_evaluate(
         input_csv: str,
         out_checklist_path: Path,
+        docker_completed_event: threading.Event = None,
 ) -> Dict[str, Any]:
     """
     For each row in the checklist CSV, builds a prompt combining the system prompt,
@@ -381,12 +382,21 @@ def operation_gemini_evaluate(
         if 'LLM Comments' not in review_checklist_df.columns:
             review_checklist_df['LLM Comments'] = ''
 
+            # Phase 1: Process all rows except input_type == 'file'
+        deferred_rows = []
+
         # Process each row
         total_rows = len(review_checklist_df)
         print(f"[llm] Processing {total_rows} checklist items...")
+        logs_path = ""
 
         for idx, row in review_checklist_df.iterrows():
             print(f"[llm] Evaluating row {idx + 1}/{total_rows}")
+
+            input_type = str(row.get('Input Type', '')).strip()
+            if input_type == 'file':
+                deferred_rows.append(idx)
+                continue  # skip for now
 
             # Extract checkpoint information
             topic = str(row.get('Topics', '')) if not pd.isna(row.get('Topics')) else ''
@@ -400,12 +410,28 @@ def operation_gemini_evaluate(
                 print(f"[llm] Skipping row {idx} - missing checkpoint or system prompt")
                 continue
             input_data = "No specific input data provided"
+
             if input_type.strip() and input_type.strip() == 'csv':
                 input_data = input_df.iloc[0].get(input_field.strip(), None)
+
+            task_id = input_df.iloc[0].get("Task_id".strip(), None)
+            project_root = Path(__file__).parent.parent
+            logs_path = project_root / "output" / str(task_id)
+
+            if input_type.strip() and input_type.strip() == 'file':
+                file_path = logs_path / "execution" / f"{input_type.strip()}.log"
+                if file_path.exists() and file_path.is_file():
+                    # Read the file content
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        input_data = f.read()
+                else:
+                    # File not found, fallback
+                    input_data = None
 
             # Build checkpoint text
             checkpoint_text = f"Topic: {topic}\nCheckpoint: {checkpoint}"
             # Get corresponding input data
+            print(f"{input_data}")
 
             if input_field.strip() and input_field != 'NA':
                 # Try to find matching data in input CSV
@@ -413,7 +439,7 @@ def operation_gemini_evaluate(
                     input_row = input_df.iloc[idx]
                     input_data = f"Input Field Required: {input_field}\n"
                     input_data += "\n".join([f"{col}: {val}" for col, val in input_row.items()
-                                         if not pd.isna(val)])
+                                             if not pd.isna(val)])
                 else:
                     input_data = f"Input Field Required: {input_field}\n(No corresponding input row found)"
 
@@ -423,7 +449,7 @@ def operation_gemini_evaluate(
                 checkpoint_text=checkpoint_text,
                 input_data=input_data,
                 api_key=gemini_api_key
-                )
+            )
             print(evaluation)
             # Update the dataframe
             review_checklist_df.at[idx, 'Followed'] = evaluation['followed']
@@ -433,6 +459,31 @@ def operation_gemini_evaluate(
             # Rate limiting - be polite to the API
             time.sleep(1)
 
+        # Phase 2: Wait for Docker and process file-dependent rows
+        if deferred_rows and docker_completed_event and logs_path:
+            print("[llm] Waiting for Docker to finish for file-based input...")
+            docker_completed_event.wait()  # BLOCK until Docker completes
+
+            for idx in deferred_rows:
+                row = review_checklist_df.loc[idx]
+                system_prompt = str(row.get('System Prompt', ''))
+                checkpoint_text = f"Topic: {row.get('Topics', '')}\nCheckpoint: {row.get('CheckPoints', '')}"
+                input_field = str(row.get('Input', '')).strip()
+
+                input_data = None
+                input_type = str(row.get('Input Type', '')).strip()
+                if input_type == 'file':
+                    # Read Docker-generated log file
+                    file_path = logs_path / "execution" / f"{input_field.strip()}.log"
+                    if file_path.exists() and file_path.is_file():
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            input_data = f.read()
+                    else:
+                        input_data = None
+
+                evaluation = call_gemini_with_prompt(system_prompt, checkpoint_text, input_data, gemini_api_key)
+                review_checklist_df.at[idx, 'Followed'] = evaluation['followed']
+                review_checklist_df.at[idx, 'LLM Comments'] = evaluation['comment']
 
         columns_to_remove = ["System Prompt", "Input Type", "Input"]
         review_checklist_df = review_checklist_df.drop(columns=columns_to_remove, errors='ignore')
@@ -488,6 +539,9 @@ Based on the checkpoint requirements and the provided evidence, evaluate whether
 Respond in this exact format:
 FOLLOWED: [Yes/No]
 COMMENT: [Brief explanation of your evaluation in 1-2 sentences]
+
+Important point to consider : 
+The provided Input/Evidence can be text or drive link so evaluate accordingly
 """
 
         print(f"Calling with prompt length: {len(evaluation_prompt)} characters")
@@ -613,6 +667,7 @@ def orchestrate(args):
 
     docker_result = {}
     llm_result = {}
+    docker_done_event = threading.Event()
 
     # Threads
     def t_docker():
@@ -627,11 +682,14 @@ def orchestrate(args):
             keep_container=False,
         )
 
+    docker_done_event.set()  # Signal that Docker is done
+
     def t_llm():
         nonlocal llm_result
         llm_result = operation_gemini_evaluate(
             input_csv=args.input_csv,
             out_checklist_path=checklist_out_xlsx,
+            docker_completed_event=docker_done_event,
         )
 
     th1 = threading.Thread(target=t_docker, name="docker-thread")
@@ -649,6 +707,10 @@ def orchestrate(args):
         "docker": docker_result,
         "llm": llm_result,
     }
+    input_folder = project_root / "input" / str(args.task_id)
+    batches_folder = project_root / "batches"
+    configuration.delete_folder(input_folder)
+    configuration.delete_folder(batches_folder)
     return summary
 
 
