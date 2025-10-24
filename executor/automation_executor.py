@@ -1,29 +1,3 @@
-"""
-- Parallel Operation 1 (Docker orchestration):
-  * docker load image from a tar
-  * start a container from the image (keeps container alive)
-  * docker cp local .git folder into container:/app/.git
-  * docker exec entrypoint.sh inside the running container with the provided
-    commit environment variables and runCommand
-  * capture stdout/stderr of the entrypoint execution into a .txt log file
-
-- Parallel Operation 2 (LLM-based checklist evaluation):
-  * Read input.csv and the review checklist .xlsx
-  * For each checklist row, build a prompt using the checklist row text and a
-    corresponding input.csv row (by index) and send to a configurable Gemini
-    endpoint using the provided API token
-  * Write the LLM's evaluation into column D of the checklist workbook
-
-At the end: combine results and write an output .xlsx with logs & checklist
-results.
-
-USAGE (example):
-python3 automation_evaluator.py \
-  --docker-tar /path/to/docker_image.tar \
-  --local-git /path/to/local/project/.git \
-  --input-csv /path/to/input.csv \
-"""
-
 import json
 import subprocess
 import threading
@@ -418,44 +392,50 @@ def operation_gemini_evaluate(
             topic = str(row.get('Topics', '')) if not pd.isna(row.get('Topics')) else ''
             checkpoint = str(row.get('CheckPoints', '')) if not pd.isna(row.get('CheckPoints')) else ''
             input_field = str(row.get('Input', '')) if not pd.isna(row.get('Input')) else ''
+            input_type = str(row.get('Input Type', '')) if not pd.isna(row.get('Input Type')) else ''
             system_prompt = str(row.get('System Prompt', '')) if not pd.isna(row.get('System Prompt')) else ''
 
             # Skip rows without checkpoints or system prompts
             if not checkpoint.strip() or not system_prompt.strip():
                 print(f"[llm] Skipping row {idx} - missing checkpoint or system prompt")
                 continue
+            input_data = "No specific input data provided"
+            if input_type.strip() and input_type.strip() == 'csv':
+                input_data = input_df.iloc[0].get(input_field.strip(), None)
 
             # Build checkpoint text
             checkpoint_text = f"Topic: {topic}\nCheckpoint: {checkpoint}"
+            # Get corresponding input data
 
-        # Get corresponding input data
-        input_data = "No specific input data provided"
-        if input_field.strip() and input_field != 'NA':
-            # Try to find matching data in input CSV
-            if idx < len(input_df):
-                input_row = input_df.iloc[idx]
-                input_data = f"Input Field Required: {input_field}\n"
-                input_data += "\n".join([f"{col}: {val}" for col, val in input_row.items()
+            if input_field.strip() and input_field != 'NA':
+                # Try to find matching data in input CSV
+                if idx < len(input_df):
+                    input_row = input_df.iloc[idx]
+                    input_data = f"Input Field Required: {input_field}\n"
+                    input_data += "\n".join([f"{col}: {val}" for col, val in input_row.items()
                                          if not pd.isna(val)])
-            else:
-                input_data = f"Input Field Required: {input_field}\n(No corresponding input row found)"
+                else:
+                    input_data = f"Input Field Required: {input_field}\n(No corresponding input row found)"
 
-        # Call Gemini API
-        evaluation = call_gemini_with_prompt(
-            system_prompt=system_prompt,
-            checkpoint_text=checkpoint_text,
-            input_data=input_data,
-            api_key=gemini_api_key
-        )
+            # Call Gemini API
+            evaluation = call_gemini_with_prompt(
+                system_prompt=system_prompt,
+                checkpoint_text=checkpoint_text,
+                input_data=input_data,
+                api_key=gemini_api_key
+                )
+            print(evaluation)
+            # Update the dataframe
+            review_checklist_df.at[idx, 'Followed'] = evaluation['followed']
+            review_checklist_df.at[idx, 'LLM Comments'] = evaluation['comment']
 
-        # Update the dataframe
-        review_checklist_df.at[idx, 'Followed'] = evaluation['followed']
-        review_checklist_df.at[idx, 'LLM Comments'] = evaluation['comment']
+            print(f"[llm] Row {idx}: {evaluation['followed']} - {evaluation['comment'][:50]}...")
+            # Rate limiting - be polite to the API
+            time.sleep(1)
 
-        print(f"[llm] Row {idx}: {evaluation['followed']} - {evaluation['comment'][:50]}...")
 
-        # Rate limiting - be polite to the API
-        time.sleep(1)
+        columns_to_remove = ["System Prompt", "Input Type", "Input"]
+        review_checklist_df = review_checklist_df.drop(columns=columns_to_remove, errors='ignore')
 
         # Save the updated CSV
         out_checklist_path.mkdir(parents=True, exist_ok=True)
@@ -489,7 +469,7 @@ def call_gemini_with_prompt(system_prompt: str, checkpoint_text: str, input_data
         api_key: Gemini API key
     """
     try:
-        gemini_api_endpoint: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=",
+        gemini_api_endpoint: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key="
         # Build the full endpoint URL
         full_endpoint = f"{gemini_api_endpoint}{api_key}"
 
@@ -512,7 +492,6 @@ COMMENT: [Brief explanation of your evaluation in 1-2 sentences]
 
         print(f"Calling with prompt length: {len(evaluation_prompt)} characters")
 
-        # Prepare the request payload matching the JavaScript version
         nl_data = {
             'contents': [{
                 'parts': [
