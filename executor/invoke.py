@@ -4,6 +4,7 @@ import zipfile
 from pathlib import Path
 
 import pandas as pd
+
 from executor.automation_executor import automation_executor
 
 
@@ -70,5 +71,4 @@ def review_executor(task_id):
                         baseCommit3=commit_data["baseCommit3"],
                         agentTurnCommit3=commit_data["agentTurnCommit3"],
                         testTurnCommit3=commit_data["testTurnCommit3"],
-                        runCommand=commit_data["runCommand"],)
-
+                        runCommand=commit_data["runCommand"], )

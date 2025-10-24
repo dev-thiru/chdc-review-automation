@@ -54,12 +54,24 @@ def run_cmd(cmd, capture_output=True, check=True, env=None):
     return completed
 
 
+def show_loading(message="Loading Docker image", interval=2):
+    """Display a loading message every few seconds until stopped."""
+    stop_event = threading.Event()
+
+    def loader():
+        dots = 0
+        while not stop_event.is_set():
+            print(f"\r{message}{'.' * (dots % 4)}", end='', flush=True)
+            dots += 1
+            time.sleep(interval)
+        print("\r", end='')  # clear line when done
+
+    thread = threading.Thread(target=loader)
+    thread.start()
+    return stop_event
+
+
 # --------------------------- Operation 1: Docker Execution ---------------------------
-
-
-from pathlib import Path
-from typing import Any, Dict
-import subprocess
 
 def operation_docker(
         task_id: str,
@@ -80,8 +92,14 @@ def operation_docker(
         # ----------------------------
         # 1) Load Docker image
         # ----------------------------
-        print(f"[docker] Loading image from: {docker_tar}")
-        p = subprocess.run(["docker", "load", "-i", docker_tar], capture_output=True, text=True, check=True)
+        stop_event = show_loading("[docker] Loading Docker image", interval=2)
+        try:
+            print(f"[docker] Loading image from: {docker_tar}")
+            p = subprocess.run(["docker", "load", "-i", docker_tar], capture_output=True, text=True, check=True)
+        finally:
+            # Stop loading animation
+            stop_event.set()
+
         stdout = p.stdout or ""
         print("[docker] load output:\n", stdout)
 
