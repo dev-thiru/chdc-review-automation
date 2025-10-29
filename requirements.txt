@@ -5,4 +5,4 @@ python-dateutil>=2.8.2
 gdown
 google_auth_oauthlib
 selenium>=4.15.0
-webdriver-manager>=5.4.0
+webdriver-manager>=4.0.0
