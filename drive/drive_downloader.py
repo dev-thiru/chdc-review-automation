@@ -944,7 +944,7 @@ class GoogleDriveDownloader:
 
                         if download_found:
                             if self._wait_for_download_start(output_path, timeout=120):
-                                success = self._wait_for_download_complete(output_path, timeout=300)
+                                success = self._wait_for_download_complete(output_path, timeout=180)
                                 driver.quit()
                                 return success
 
