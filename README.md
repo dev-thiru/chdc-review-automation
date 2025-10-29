@@ -52,15 +52,6 @@ All tasks require manual Google Drive authentication for file access. Follow the
 
 Enter your username and password when prompted.
 
-**Click "Download Anyway"** manually to download .tar when that tab gets opened in the browser
-![Alt Text](/config/images/tar_file.png)
-
-
-**Click "Download"** manually to download git folder when that gets opened in the browser
-
-![Alt Text](/config/images/git_folder.png)
-
-
 ### Output
 
 The execution results will be generated in the `outputs` folder, containing:

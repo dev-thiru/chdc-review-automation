@@ -1,597 +1,1107 @@
 import json
-import os
-import platform
+import re
 import time
 from pathlib import Path
+from typing import Optional, Dict
+from urllib.parse import urlencode
 
+import requests
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# Configuration
 COOKIE_FILE = Path.home() / ".drive_selenium_cookies.json"
+SESSION_FILE = Path.home() / ".drive_session_info.json"
 PROFILE_PATH = None
-_SHARED_DRIVER = None  # Shared driver instance for multiple downloads
+_SHARED_DRIVER = None
 
 
-def get_webdriver(download_path, profile_path=None, headless=False):
-    """Return WebDriver with download directory set"""
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        from selenium.webdriver.chrome.service import Service
+class GoogleDriveDownloader:
+    """Enhanced Google Drive downloader with backend download support"""
 
-        # Ensure download path is absolute
-        download_path = str(Path(download_path).resolve())
+    def __init__(self, cookie_file: Path = COOKIE_FILE, session_file: Path = SESSION_FILE):
+        self.cookie_file = cookie_file
+        self.session_file = session_file
+        self.session = requests.Session()
+        self.driver = None
+        self.authenticated = False
 
-        options = webdriver.ChromeOptions()
-
-        # Critical download settings
-        prefs = {
-            "download.default_directory": download_path,
-            "download.prompt_for_download": False,
-            "download.directory_upgrade": True,
-            "safebrowsing.enabled": False,
-            "profile.default_content_settings.popups": 0,
-            "profile.content_settings.exceptions.automatic_downloads.*.setting": 1,
-            "plugins.always_open_pdf_externally": True,
-        }
-        options.add_experimental_option("prefs", prefs)
-
-        options.add_argument("--start-maximized")
-        options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-extensions")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option('useAutomationExtension', False)
-
-        if headless:
-            options.add_argument("--headless=new")
-            options.add_argument("--window-size=1920,1080")
-
-        if profile_path:
-            profile_path = str(Path(profile_path).resolve())
-            options.add_argument(f"--user-data-dir={profile_path}")
-            print(f"📁 Using Chrome profile: {profile_path}")
-
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-
-        # Remove webdriver flag
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-        print(f"✅ Chrome WebDriver initialized")
-        print(f"📥 Download directory: {download_path}")
-        return driver
-    except Exception as e:
-        print(f"❌ Chrome failed: {e}")
-        raise Exception("❌ No supported browsers found. Install Chrome and webdriver-manager.")
-
-
-def save_cookies(driver, cookie_file: Path):
-    """Save cookies to file"""
-    try:
-        cookie_file.parent.mkdir(parents=True, exist_ok=True)
-        cookies = driver.get_cookies()
-        with cookie_file.open("w", encoding="utf-8") as f:
-            json.dump(cookies, f, indent=2)
-        print(f"🔐 Cookies saved to {cookie_file} ({len(cookies)} cookies)")
-    except Exception as e:
-        print(f"⚠️ Failed to save cookies: {e}")
-
-
-def load_cookies(driver, cookie_file: Path):
-    """Load cookies from file"""
-    if not cookie_file.exists():
-        print("⚠️ No cookie file found")
-        return False
-
-    try:
-        with cookie_file.open("r", encoding="utf-8") as f:
-            cookies = json.load(f)
-
-        if not cookies:
-            print("⚠️ Cookie file is empty")
+    def _save_cookies(self, driver):
+        """Save cookies to file"""
+        try:
+            self.cookie_file.parent.mkdir(parents=True, exist_ok=True)
+            cookies = driver.get_cookies()
+            with self.cookie_file.open("w", encoding="utf-8") as f:
+                json.dump(cookies, f, indent=2)
+            print(f"🔐 Cookies saved to {self.cookie_file} ({len(cookies)} cookies)")
+            return True
+        except Exception as e:
+            print(f"⚠️ Failed to save cookies: {e}")
             return False
 
-        # Navigate to Google Drive first
-        driver.get("https://drive.google.com")
-        time.sleep(2)
+    def _load_cookies_to_session(self) -> bool:
+        """Load cookies from file into requests session"""
+        if not self.cookie_file.exists():
+            print("⚠️ No cookie file found")
+            return False
 
-        # Add each cookie
-        loaded_count = 0
-        for c in cookies:
-            try:
-                # Filter valid cookie attributes
-                cookie = {}
-                for key in ["name", "value", "path", "domain", "secure", "httpOnly"]:
-                    if key in c:
-                        cookie[key] = c[key]
+        try:
+            with self.cookie_file.open("r", encoding="utf-8") as f:
+                cookies = json.load(f)
 
-                # Handle expiry separately
-                if "expiry" in c:
-                    cookie["expiry"] = int(c["expiry"])
+            if not cookies:
+                print("⚠️ Cookie file is empty")
+                return False
 
-                driver.add_cookie(cookie)
-                loaded_count += 1
-            except Exception as e:
-                pass
+            # Clear existing cookies
+            self.session.cookies.clear()
 
-        print(f"🔁 Loaded {loaded_count}/{len(cookies)} cookies")
+            # Add cookies to requests session
+            for cookie in cookies:
+                self.session.cookies.set(
+                    name=cookie.get('name'),
+                    value=cookie.get('value'),
+                    domain=cookie.get('domain', '.google.com'),
+                    path=cookie.get('path', '/'),
+                    secure=cookie.get('secure', False)
+                )
 
-        if loaded_count > 0:
-            driver.refresh()
-            time.sleep(3)
+            print(f"✅ Loaded {len(cookies)} cookies into session")
             return True
 
-        return False
-
-    except Exception as e:
-        print(f"⚠️ Failed to load cookies: {e}")
-        return False
-
-
-def is_logged_in_drive(driver, timeout=8):
-    """Check if user is logged into Google Drive"""
-    try:
-        # Check if we're on login page
-        current_url = driver.current_url.lower()
-        if "accounts.google.com" in current_url and ("signin" in current_url or "servicelogin" in current_url):
+        except Exception as e:
+            print(f"⚠️ Failed to load cookies: {e}")
             return False
 
-        # Look for Drive UI elements
-        drive_selectors = [
-            'div[role="main"]',
-            'div[data-id]',
-            'c-wiz',
-            'div[aria-label*="Drive"]',
-            'div[role="gridcell"]',
-            'div[guidedhelpid]',
-            'div.a-nEbBXb',
-        ]
+    def _validate_session(self) -> bool:
+        """Validate if the current session is still active"""
+        print("🔍 Validating session...")
 
-        for selector in drive_selectors:
-            try:
-                element = WebDriverWait(driver, timeout).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                )
-                if element:
-                    if "servicelogin" not in current_url and "accounts.google" not in current_url:
-                        return True
-            except TimeoutException:
-                continue
+        if not self.cookie_file.exists():
+            print("⚠️ Cookie file not found")
+            return False
 
-        return False
+        if not self._load_cookies_to_session():
+            return False
 
-    except Exception as e:
-        return False
-
-
-def handle_download_anyway_popup(driver, max_wait=20):
-    """
-    Handle the 'Download anyway' button that appears when Google Drive
-    can't scan files for viruses (large files) or has input[type=submit] download buttons.
-    """
-    print("⏳ Looking for 'Download anyway' button...")
-
-    button_texts = [
-        "Download anyway",
-        "Still download",
-        "Télécharger quand même",
-        "Download",
-        "Descargar de todos modos",
-    ]
-
-    start_time = time.time()
-    found = False
-
-    while time.time() - start_time < max_wait:
-        # Check for the warning message first
         try:
-            warning = driver.find_element(By.XPATH,
-                                          "//*[contains(text(), \"can't scan\") or contains(text(), 'too large') or contains(text(), 'virus')]")
-            if warning:
-                print("⚠️ Virus scan warning detected!")
-        except:
-            pass
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+            }
 
-        # Try to find and click standard buttons
-        for btn_text in button_texts:
-            xpaths = [
-                f"//button[normalize-space()='{btn_text}']",
-                f"//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{btn_text.lower()}')]",
-                f"//span[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{btn_text.lower()}')]/ancestor::button",
-                f"//div[@role='button'][contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{btn_text.lower()}')]",
-            ]
-            for xpath in xpaths:
+            response = self.session.get(
+                'https://drive.google.com/drive/my-drive',
+                headers=headers,
+                timeout=15,
+                allow_redirects=True
+            )
+
+            # ✅ FIX: If session expired, re-authenticate and reload session
+            if 'accounts.google.com' in response.url:
+                print("⚠️ Session expired - re-authenticating...")
+                if self._authenticate_with_browser():
+                    print("✅ Session restored successfully")
+                    return True
+                else:
+                    print("❌ Failed to restore session")
+                    return False
+
+            if 'drive.google.com' in response.url and response.status_code == 200:
+                self.authenticated = True
+                print("✅ Session is valid")
+                return True
+
+            print("⚠️ Unexpected response from Drive")
+            return False
+
+        except Exception as e:
+            print(f"⚠️ Session validation failed: {e}")
+            return False
+
+    def _get_webdriver(self, headless: bool = False):
+        """Initialize WebDriver for authentication"""
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from selenium.webdriver.chrome.service import Service
+
+            options = webdriver.ChromeOptions()
+            options.add_argument("--start-maximized")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
+
+            if headless:
+                options.add_argument("--headless=new")
+                options.add_argument("--window-size=1920,1080")
+
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+            print(f"✅ Chrome WebDriver initialized")
+            return driver
+
+        except Exception as e:
+            print(f"❌ Chrome initialization failed: {e}")
+            raise
+
+    def _authenticate_with_browser(self, return_driver: bool = False):
+        """Authenticate using browser and save cookies
+
+        Args:
+            return_driver: If True, return the authenticated driver instead of closing it
+        """
+        print("\n" + "=" * 60)
+        print("🔐 AUTHENTICATION REQUIRED")
+        print("=" * 60)
+
+        try:
+            self.driver = self._get_webdriver(headless=False)
+            self.driver.get("https://drive.google.com")
+            time.sleep(3)
+
+            # Check if already logged in
+            if self._is_logged_in(self.driver):
+                print("✅ Already logged in")
+                self._save_cookies(self.driver)
+                self._load_cookies_to_session()
+                self.authenticated = True
+
+                if return_driver:
+                    return self.driver
+                else:
+                    self.driver.quit()
+                    self.driver = None
+                    return True
+
+            print("➡️ Please log in to Google Drive...")
+            print("⏳ Waiting for login (120 seconds timeout)...")
+
+            # Wait for login with extended timeout
+            if not self._wait_for_login(self.driver, timeout=120):
+                print("❌ Login timeout")
+                if not return_driver:
+                    self.driver.quit()
+                    self.driver = None
+                return False
+
+            print("✅ Login successful!")
+
+            # Wait a bit more to ensure all cookies are set
+            time.sleep(5)  # Increased from 3 to 5
+
+            self._save_cookies(self.driver)
+
+            # Reload cookies into session
+            self._load_cookies_to_session()
+            self.authenticated = True
+
+            if return_driver:
+                return self.driver
+            else:
+                self.driver.quit()
+                self.driver = None
+                return True
+
+        except Exception as e:
+            print(f"❌ Authentication failed: {e}")
+            if not return_driver and self.driver:
                 try:
-                    btn = WebDriverWait(driver, 2).until(
-                        EC.element_to_be_clickable((By.XPATH, xpath))
-                    )
-                    if btn:
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                        try:
-                            btn.click()
-                            print(f"✅ Clicked '{btn_text}' button successfully!")
-                        except:
-                            driver.execute_script("arguments[0].click();", btn)
-                            print(f"✅ Clicked '{btn_text}' button via JavaScript!")
-                        time.sleep(3)
-                        return True
+                    self.driver.quit()
                 except:
+                    pass
+                self.driver = None
+            return False
+
+    def _is_logged_in(self, driver, timeout: int = 8) -> bool:
+        """Check if user is logged into Google Drive"""
+        try:
+            current_url = driver.current_url.lower()
+            if "accounts.google.com" in current_url and ("signin" in current_url or "servicelogin" in current_url):
+                return False
+
+            drive_selectors = [
+                'div[role="main"]',
+                'c-wiz',
+                'div[data-id]',
+                'div[guidedhelpid]',
+            ]
+
+            for selector in drive_selectors:
+                try:
+                    element = WebDriverWait(driver, timeout).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    if element and "servicelogin" not in current_url:
+                        return True
+                except TimeoutException:
                     continue
 
-        # NEW: Handle input[type=submit] with id="uc-download-link"
-        try:
-            input_btn = driver.find_element(By.CSS_SELECTOR, 'input#uc-download-link[type="submit"]')
-            if input_btn.is_displayed() and input_btn.is_enabled():
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_btn)
-                try:
-                    input_btn.click()
-                    print("✅ Clicked 'Download anyway' input button!")
-                except:
-                    driver.execute_script("arguments[0].click();", input_btn)
-                    print("✅ Clicked 'Download anyway' input button via JavaScript!")
-                time.sleep(3)
-                return True
-        except:
-            pass
-
-        # If nothing found, wait a bit and retry
-        time.sleep(1)
-
-    print("ℹ️ Not able to find 'Download anyway' button , if present click manually")
-    close_current_tab(driver)
-    return found
-
-
-def close_current_tab(driver):
-    """Close the current browser tab without closing the entire browser"""
-    try:
-        # Check if there are multiple tabs
-        if len(driver.window_handles) > 1:
-            driver.close()  # Close current tab
-            driver.switch_to.window(driver.window_handles[0])  # Switch to first remaining tab
-            print("🔒 Closed current tab, switched to previous tab")
-        else:
-            # Only one tab, open a new blank tab before closing
-            driver.execute_script("window.open('about:blank', '_blank');")
-            time.sleep(0.5)
-            driver.switch_to.window(driver.window_handles[1])
-            driver.close()
-            driver.switch_to.window(driver.window_handles[0])
-            print("🔒 Closed download tab, returned to blank tab")
-    except Exception as e:
-        print(f"⚠️ Could not close tab: {e}")
-
-
-def wait_for_download(download_path, timeout=900, check_interval=2):
-    """Wait for download to complete with better detection"""
-    print("\n⏳ Waiting for download to complete...")
-    download_path = Path(download_path).resolve()
-    start_time = time.time()
-
-    # Get initial file list
-    initial_files = set()
-    try:
-        initial_files = {f.name for f in download_path.iterdir() if f.is_file()}
-    except:
-        pass
-
-    last_size = {}
-    no_change_count = 0
-
-    while True:
-        elapsed = time.time() - start_time
-
-        if elapsed > timeout:
-            print(f"❌ Download timeout after {timeout}s")
             return False
 
-        time.sleep(check_interval)
+        except Exception:
+            return False
 
-        # Check for temporary download files
-        temp_extensions = ['*.crdownload', '*.tmp', '*.part', '*.download']
-        temp_files = []
-        for ext in temp_extensions:
-            temp_files.extend(download_path.glob(ext))
+    def _wait_for_login(self, driver, timeout: int = 120) -> bool:
+        """Wait for user to complete login"""
+        start_time = time.time()
 
-        if temp_files:
-            # Download in progress
-            for tf in temp_files:
+        while time.time() - start_time < timeout:
+            if self._is_logged_in(driver):
+                return True
+            time.sleep(2)
+
+        return False
+
+    def _extract_file_id(self, url: str) -> Optional[str]:
+        """Extract file ID from Google Drive URL"""
+        patterns = [
+            r'/file/d/([a-zA-Z0-9_-]+)',
+            r'/folders/([a-zA-Z0-9_-]+)',
+            r'[?&]id=([a-zA-Z0-9_-]+)',
+            r'/open\?id=([a-zA-Z0-9_-]+)',
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+
+        return None
+
+    def _is_folder(self, url: str) -> bool:
+        """Check if URL is a folder"""
+        return '/folders/' in url.lower() or '/drive/folders/' in url.lower()
+
+    def _parse_download_form(self, html_content: str) -> Optional[Dict]:
+        """Parse the virus scan warning form to extract download parameters"""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+
+            # Find the download form
+            form = soup.find('form', {'id': 'download-form'})
+            if not form:
+                return None
+
+            # Extract form action and all hidden inputs
+            action = form.get('action', '')
+            params = {}
+
+            for input_tag in form.find_all('input'):
+                name = input_tag.get('name')
+                value = input_tag.get('value')
+                if name and value:
+                    params[name] = value
+
+            return {
+                'action': action,
+                'params': params
+            }
+        except Exception as e:
+            print(f"⚠️ Error parsing form: {e}")
+            return None
+
+    def _download_file_direct(self, file_id: str, output_path: Path, chunk_size: int = 32768) -> bool:
+        """Download file directly using authenticated session with large file support"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Referer': 'https://drive.google.com/',
+            }
+
+            # Step 1: Initial request to check for virus scan warning
+            print(f"🔗 Initiating download request...")
+            url = f'https://drive.google.com/uc?export=download&id={file_id}'
+
+            response = self.session.get(url, headers=headers, stream=True, timeout=30)
+
+            # Check content type
+            content_type = response.headers.get('Content-Type', '').lower()
+
+            # If HTML response, need to handle form submission
+            if 'text/html' in content_type:
+                print("⚠️ Received HTML response - checking for download form...")
+
+                # Read the HTML content
+                html_content = response.text
+
+                # Check if it's the virus scan warning page
+                if 'virus' in html_content.lower() or 'download-form' in html_content:
+                    print("🔍 Virus scan warning detected - parsing download form...")
+
+                    # Parse the form
+                    form_data = self._parse_download_form(html_content)
+
+                    if form_data:
+                        # Build the download URL with all form parameters
+                        download_url = form_data['action']
+                        params = form_data['params']
+
+                        # Build query string
+                        query_string = urlencode(params)
+                        full_url = f"{download_url}?{query_string}"
+
+                        print(f"✅ Form parsed - initiating actual download...")
+
+                        # Make the actual download request
+                        response = self.session.get(
+                            full_url,
+                            headers=headers,
+                            stream=True,
+                            timeout=30,
+                            allow_redirects=True
+                        )
+                    else:
+                        print("⚠️ Could not parse download form - trying alternative method...")
+
+                        # Fallback: extract confirm token and try direct download
+                        confirm_match = re.search(r'confirm=([a-zA-Z0-9_-]+)', html_content)
+                        uuid_match = re.search(r'uuid=([a-zA-Z0-9_-]+)', html_content)
+
+                        if confirm_match or uuid_match:
+                            params = {'id': file_id, 'export': 'download'}
+                            if confirm_match:
+                                params['confirm'] = confirm_match.group(1)
+                            if uuid_match:
+                                params['uuid'] = uuid_match.group(1)
+
+                            download_url = f"https://drive.usercontent.google.com/download?{urlencode(params)}"
+                            response = self.session.get(
+                                download_url,
+                                headers=headers,
+                                stream=True,
+                                timeout=30,
+                                allow_redirects=True
+                            )
+                else:
+                    print("⚠️ HTML response but no virus scan warning - may be auth issue")
+                    if 'accounts.google.com' in html_content:
+                        print("❌ Authentication required - session expired")
+                        return False
+
+            # Validate response
+            if response.status_code != 200:
+                print(f"❌ Download failed with status code: {response.status_code}")
+                return False
+
+            # Double-check content type after form submission
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'text/html' in content_type:
+                # Still HTML - check what it is
+                preview_content = response.text[:1000]
+                if 'accounts.google.com' in preview_content:
+                    print("❌ Authentication required - session may have expired")
+                    return False
+                elif 'quota' in preview_content.lower():
+                    print("❌ Download quota exceeded")
+                    return False
+                elif len(response.content) < 10000:  # Small HTML response
+                    print(f"⚠️ Unexpected HTML response:")
+                    print(preview_content[:500])
+                    return False
+
+            # Extract filename
+            filename = None
+            if 'Content-Disposition' in response.headers:
+                disposition = response.headers['Content-Disposition']
+                # Handle both quoted and unquoted filenames
+                filename_match = re.search(r'filename\*?=["\']?([^"\';\n]+)', disposition)
+                if filename_match:
+                    filename = filename_match.group(1).strip().strip('"\'')
+                    # Handle RFC 5987 encoding
+                    if filename.startswith('UTF-8\'\''):
+                        filename = filename[7:]
+
+            if not filename:
+                filename = f'download_{file_id}'
+
+            # Clean filename
+            filename = filename.replace('/', '_').replace('\\', '_')
+
+            # Ensure output path
+            if output_path.is_dir():
+                output_file = output_path / filename
+            else:
+                output_file = output_path
+
+            # Get file size
+            total_size = int(response.headers.get('content-length', 0))
+
+            print(f"📥 Downloading: {filename}")
+            if total_size:
+                print(f"📊 Size: {total_size / (1024 * 1024):.2f} MB")
+            else:
+                print(f"📊 Size: Unknown (streaming)")
+
+            # Download with progress tracking
+            downloaded = 0
+            start_time = time.time()
+            last_update = start_time
+
+            with open(output_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        # Update progress every second
+                        current_time = time.time()
+                        if current_time - last_update >= 1.0:
+                            elapsed = current_time - start_time
+                            speed = downloaded / elapsed / (1024 * 1024) if elapsed > 0 else 0
+
+                            if total_size:
+                                progress = (downloaded / total_size) * 100
+                                eta = (total_size - downloaded) / (downloaded / elapsed) if downloaded > 0 else 0
+                                print(f"\r⏳ Progress: {progress:.1f}% | "
+                                      f"{downloaded / (1024 * 1024):.2f}/{total_size / (1024 * 1024):.2f} MB | "
+                                      f"Speed: {speed:.2f} MB/s | ETA: {eta:.0f}s", end='', flush=True)
+                            else:
+                                print(f"\r⏳ Downloaded: {downloaded / (1024 * 1024):.2f} MB | Speed: {speed:.2f} MB/s",
+                                      end='', flush=True)
+
+                            last_update = current_time
+
+            # Verify download
+            if downloaded == 0:
+                print(f"\n❌ Downloaded 0 bytes - file may not be accessible")
+                output_file.unlink(missing_ok=True)
+                return False
+
+            # Final summary
+            elapsed = time.time() - start_time
+            avg_speed = downloaded / elapsed / (1024 * 1024) if elapsed > 0 else 0
+
+            print(f"\n✅ Download completed!")
+            print(f"📁 File: {output_file}")
+            print(f"📊 Size: {downloaded / (1024 * 1024):.2f} MB")
+            print(f"⏱️ Time: {elapsed:.1f}s")
+            print(f"🚀 Speed: {avg_speed:.2f} MB/s")
+
+            return True
+
+        except Exception as e:
+            print(f"\n❌ Download failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _download_folder_as_zip(self, folder_id: str, output_path: Path, chunk_size: int = 32768) -> bool:
+        """Download entire folder as ZIP file using browser automation"""
+        try:
+            print(f"📦 Downloading folder as ZIP using browser...")
+
+            # First, try backend method for small folders
+            if self._try_backend_folder_download(folder_id, output_path):
+                return True
+
+            # If backend fails, use browser automation
+            print("🌐 Backend download failed - using browser automation...")
+            return self._download_folder_with_browser(folder_id, output_path)
+
+        except Exception as e:
+            print(f"\n❌ Folder download failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _try_backend_folder_download(self, folder_id: str, output_path: Path) -> bool:
+        """Try to download folder via backend API (may not work for all folders)"""
+        try:
+            print(f"🔗 Attempting backend ZIP download...")
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': f'https://drive.google.com/drive/folders/{folder_id}',
+            }
+
+            # Try direct download endpoint
+            url = f'https://drive.google.com/drive/folders/{folder_id}/download'
+            response = self.session.get(url, headers=headers, stream=True, timeout=30, allow_redirects=True)
+
+            content_type = response.headers.get('Content-Type', '').lower()
+
+            # Check if we got actual ZIP data
+            if 'application/zip' in content_type or 'application/x-zip' in content_type:
+                # We got a ZIP file!
+                return self._save_zip_response(response, folder_id, output_path)
+
+            # If HTML, backend method won't work
+            return False
+
+        except Exception as e:
+            print(f"⚠️ Backend method failed: {e}")
+            return False
+
+    def _save_zip_response(self, response, folder_id: str, output_path: Path) -> bool:
+        """Save ZIP response to file"""
+        try:
+            # Extract filename
+            filename = None
+            if 'Content-Disposition' in response.headers:
+                disposition = response.headers['Content-Disposition']
+                filename_match = re.search(r'filename\*?=["\']?([^"\';\n]+)', disposition)
+                if filename_match:
+                    filename = filename_match.group(1).strip().strip('"\'')
+
+            if not filename:
+                filename = f'folder_{folder_id}.zip'
+
+            if not filename.lower().endswith('.zip'):
+                filename = f"{filename}.zip"
+
+            output_file = output_path / filename
+            total_size = int(response.headers.get('content-length', 0))
+
+            print(f"📥 Downloading: {filename}")
+            if total_size:
+                print(f"📊 Size: {total_size / (1024 * 1024):.2f} MB")
+
+            downloaded = 0
+            start_time = time.time()
+
+            with open(output_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=32768):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+            elapsed = time.time() - start_time
+            print(f"\n✅ ZIP download completed!")
+            print(f"📁 File: {output_file}")
+            print(f"📊 Size: {downloaded / (1024 * 1024):.2f} MB")
+            print(f"⏱️ Time: {elapsed:.1f}s")
+
+            return True
+
+        except Exception as e:
+            print(f"❌ Error saving ZIP: {e}")
+            return False
+
+    def _load_cookies_to_browser(self, driver) -> bool:
+        """Load cookies from file into Selenium browser with improved handling"""
+        if not self.cookie_file.exists():
+            print("⚠️ No cookie file found")
+            return False
+
+        try:
+            with self.cookie_file.open("r") as f:
+                cookies = json.load(f)
+
+            successful_cookies = 0
+            failed_cookies = 0
+            critical_cookies = []
+
+            for cookie in cookies:
                 try:
-                    size = tf.stat().st_size
-                    if tf.name in last_size:
-                        if size == last_size[tf.name]:
-                            no_change_count += 1
-                        else:
-                            no_change_count = 0
-                    last_size[tf.name] = size
+                    cookie_name = cookie.get('name', '')
 
-                    print(f"⏳ Downloading: {tf.name} ({size / (1024 * 1024):.1f} MB) - {elapsed:.0f}s elapsed")
+                    # Track critical auth cookies
+                    if any(x in cookie_name.upper() for x in ['SID', 'HSID', 'SSID', 'APISID', 'SAPISID', '__Secure']):
+                        critical_cookies.append(cookie_name)
+
+                    # Clean up cookie data for Selenium
+                    cookie_data = {
+                        'name': cookie_name,
+                        'value': cookie.get('value'),
+                    }
+
+                    # Handle domain - this is critical
+                    domain = cookie.get('domain', '')
+                    if domain:
+                        # Selenium requires domain to start with dot for subdomains
+                        if not domain.startswith('.') and 'google.com' in domain:
+                            domain = '.' + domain
+                        cookie_data['domain'] = domain
+                    else:
+                        # Default to .google.com if no domain specified
+                        cookie_data['domain'] = '.google.com'
+
+                    # Path
+                    cookie_data['path'] = cookie.get('path', '/')
+
+                    # Secure flag - critical for Google cookies
+                    if cookie.get('secure'):
+                        cookie_data['secure'] = True
+
+                    # HttpOnly flag
+                    if cookie.get('httpOnly'):
+                        cookie_data['httpOnly'] = True
+
+                    # SameSite
+                    if 'sameSite' in cookie:
+                        cookie_data['sameSite'] = cookie['sameSite']
+
+                    # Expiry - handle both formats
+                    if 'expiry' in cookie:
+                        cookie_data['expiry'] = int(cookie['expiry'])
+                    elif 'expirationDate' in cookie:
+                        cookie_data['expiry'] = int(cookie['expirationDate'])
+
+                    driver.add_cookie(cookie_data)
+                    successful_cookies += 1
+
+                except Exception as e:
+                    failed_cookies += 1
+                    # Log which critical cookies failed
+                    if cookie_name in critical_cookies:
+                        print(f"⚠️ CRITICAL: Failed to load auth cookie '{cookie_name}': {e}")
+                    continue
+
+            print(f"✅ Loaded {successful_cookies} cookies ({failed_cookies} failed)")
+
+            # Check if we loaded any critical auth cookies
+            if successful_cookies == 0:
+                print("❌ No cookies loaded successfully")
+                return False
+
+            if failed_cookies > 0 and any(c in str(critical_cookies) for c in ['SID', 'HSID']):
+                print("⚠️ Warning: Some critical authentication cookies failed to load")
+
+            return successful_cookies > 0
+
+        except Exception as e:
+            print(f"⚠️ Error loading cookies: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _download_folder_with_browser(self, folder_id: str, output_path: Path, retry_count: int = 0) -> bool:
+        """Download folder using browser automation (most reliable method)"""
+        try:
+            from webdriver_manager.chrome import ChromeDriverManager
+            from selenium.webdriver.chrome.service import Service
+            from selenium.webdriver.common.action_chains import ActionChains
+            from selenium.webdriver.common.keys import Keys
+
+            print("🌐 Initializing browser for folder download...")
+
+            # Setup Chrome with download directory
+            download_path = str(output_path.resolve())
+
+            options = webdriver.ChromeOptions()
+            prefs = {
+                "download.default_directory": download_path,
+                "download.prompt_for_download": False,
+                "download.directory_upgrade": True,
+                "safebrowsing.enabled": False,
+                "profile.default_content_settings.popups": 0,
+            }
+            options.add_experimental_option("prefs", prefs)
+            options.add_argument("--start-maximized")
+            options.add_argument("--disable-blink-features=AutomationControlled")
+            options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            options.add_experimental_option('useAutomationExtension', False)
+
+            # Suppress DevTools and error logs
+            options.add_experimental_option('excludeSwitches', ['enable-logging'])
+            options.add_argument('--log-level=3')
+            options.add_argument('--disable-gpu')
+
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+            try:
+                # ✅ CRITICAL FIX: Navigate to google.com (not accounts.google.com) to set base domain
+                print("🔑 Loading authentication session...")
+                driver.get("https://www.google.com")
+                time.sleep(3)
+
+                # ✅ Load cookies using improved method
+                cookies_loaded = self._load_cookies_to_browser(driver)
+
+                # ✅ If no cookies loaded, authenticate now
+                if not cookies_loaded:
+                    if retry_count >= 2:
+                        print("❌ Max retry attempts reached")
+                        driver.quit()
+                        return False
+
+                    print("⚠️ No valid session - authentication required")
+                    driver.quit()
+
+                    # ✅ CRITICAL: Get authenticated driver directly (don't close it)
+                    print("🔐 Authenticating and reusing browser session...")
+                    auth_driver = self._authenticate_with_browser(return_driver=True)
+
+                    if not auth_driver:
+                        print("❌ Authentication failed")
+                        return False
+
+                    # Use the authenticated driver directly
+                    driver = auth_driver
+                    print("✅ Reusing authenticated browser session")
+
+                    # Already on Drive, just need to navigate to folder
+                    folder_url = f'https://drive.google.com/drive/folders/{folder_id}'
+                    print(f"📂 Opening folder: {folder_url}")
+                    driver.get(folder_url)
+                    time.sleep(8)
+
+                    # Skip verification, we know we're authenticated
+                    print("✅ Using active authenticated session")
+                else:
+                    # ✅ Navigate to Drive to activate session - with longer wait
+                    print("🔄 Activating session...")
+                    driver.get("https://drive.google.com/drive/my-drive")
+
+                    # ✅ CRITICAL: Wait longer for Drive to fully load and process cookies
+                    time.sleep(10)  # Increased from 8 to 10 seconds
+
+                    # ✅ Verify authentication with better logic
+                    max_verification_attempts = 5  # Increased from 3 to 5
+                    session_valid = False
+
+                    for attempt in range(max_verification_attempts):
+                        current_url = driver.current_url.lower()
+
+                        # Check if we're on Drive (not login page)
+                        if 'drive.google.com' in current_url and 'accounts.google.com' not in current_url:
+                            # Check if we can see Drive UI elements (indicates logged in)
+                            try:
+                                # Try multiple selectors to confirm Drive loaded
+                                ui_loaded = False
+                                drive_selectors = [
+                                    'div[role="main"]',
+                                    'c-wiz',
+                                    'div[data-id]',
+                                    '[guidedhelpid]',
+                                    'div[jscontroller]'
+                                ]
+
+                                for selector in drive_selectors:
+                                    try:
+                                        element = WebDriverWait(driver, 3).until(
+                                            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                                        )
+                                        if element:
+                                            ui_loaded = True
+                                            break
+                                    except:
+                                        continue
+
+                                if ui_loaded:
+                                    print("✅ Session authenticated in browser")
+                                    session_valid = True
+                                    break
+                                else:
+                                    if attempt < max_verification_attempts - 1:
+                                        print(
+                                            f"⏳ Drive UI not loaded yet... (attempt {attempt + 1}/{max_verification_attempts})")
+                                        time.sleep(5)
+                                        # Try refreshing if stuck
+                                        if attempt >= 2:
+                                            print("🔄 Refreshing page...")
+                                            driver.refresh()
+                                            time.sleep(5)
+                            except:
+                                if attempt < max_verification_attempts - 1:
+                                    print(
+                                        f"⏳ Waiting for Drive UI... (attempt {attempt + 1}/{max_verification_attempts})")
+                                    time.sleep(5)
+                                continue
+                        elif 'accounts.google.com' in current_url:
+                            if attempt < max_verification_attempts - 1:
+                                print(f"⏳ Still on login page... (attempt {attempt + 1}/{max_verification_attempts})")
+                                time.sleep(6)
+                                # Try clicking through any prompts
+                                try:
+                                    # Look for "Continue" or "Next" buttons
+                                    continue_buttons = driver.find_elements(By.XPATH,
+                                                                            '//button[contains(., "Continue") or contains(., "Next") or @type="submit"]')
+                                    if continue_buttons:
+                                        print("🔘 Found continue button, clicking...")
+                                        continue_buttons[0].click()
+                                        time.sleep(3)
+                                except:
+                                    pass
+                            else:
+                                # Last attempt failed
+                                break
+                        else:
+                            # Unknown state
+                            if attempt < max_verification_attempts - 1:
+                                print(f"⏳ Checking session... (attempt {attempt + 1}/{max_verification_attempts})")
+                                time.sleep(5)
+
+                    # If validation failed after all attempts
+                    if not session_valid:
+                        if retry_count >= 2:
+                            print("❌ Max retry attempts reached")
+                            driver.quit()
+                            return False
+
+                        print("❌ Session not valid - re-authenticating...")
+                        driver.quit()
+
+                        # ✅ Get authenticated driver directly
+                        print("🔐 Authenticating and reusing browser session...")
+                        auth_driver = self._authenticate_with_browser(return_driver=True)
+
+                        if not auth_driver:
+                            print("❌ Authentication failed")
+                            return False
+
+                        # Use the authenticated driver directly
+                        driver = auth_driver
+                        print("✅ Reusing authenticated browser session")
+
+                        # Already on Drive, navigate to folder
+                        folder_url = f'https://drive.google.com/drive/folders/{folder_id}'
+                        print(f"📂 Opening folder: {folder_url}")
+                        driver.get(folder_url)
+                        time.sleep(8)
+
+                        print("✅ Using active authenticated session")
+                    else:
+                        # Navigate to folder
+                        folder_url = f'https://drive.google.com/drive/folders/{folder_id}'
+                        print(f"📂 Opening folder: {folder_url}")
+                        driver.get(folder_url)
+                        time.sleep(8)  # Increased wait time
+
+                        # ✅ Double-check we're still logged in after folder navigation
+                        current_url = driver.current_url.lower()
+                        if 'accounts.google.com' in current_url:
+                            print("❌ Not logged in - session expired during navigation")
+                            driver.quit()
+                            return False
+
+                        print("✅ Folder opened in browser")
+
+                print("🖱️ Trying right-click download...")
+                try:
+                    time.sleep(2)
+                    menu_clicked = find_and_click_folder(driver)
+
+                    if menu_clicked:
+                        # Look for Download option
+                        print("🔍 Looking for Download option...")
+
+                        download_selectors = ['//div[@role="menuitem"]//span[text()="Download"]',
+                                              '//div[@role="menuitem"][contains(text(), "Download")]',
+                                              '//span[text()="Download"]/ancestor::div[@role="menuitem"]',
+                                              '//div[@role="menuitem"]//div[text()="Download"]',
+
+                                              # ✅ Added selectors to handle aria-activedescendant & aria-owns
+                                              '//*[@aria-activedescendant and contains(., "Download")]',
+                                              '//*[@aria-owns]//*[contains(text(), "Download")]',
+                                              '//*[@aria-owns]//div[@role="menuitem" and contains(., "Download")]', ]
+
+                        download_found = False
+                        for selector in download_selectors:
+                            try:
+                                download_option = WebDriverWait(driver, 3).until(
+                                    EC.element_to_be_clickable((By.XPATH, selector))
+                                )
+                                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});",
+                                                      download_option)
+                                time.sleep(0.3)
+
+                                active = driver.switch_to.active_element
+                                active.send_keys(Keys.ARROW_DOWN)   # Move to Download option
+                                time.sleep(0.3)
+                                active.send_keys(Keys.ENTER)        # Confirm
+                                print("✅ Download triggered via keyboard keys")
+                                download_found = True
+                                print("✅ Clicked Download option")
+                            except:
+                                continue
+                            download_found = True
+
+                        if download_found:
+                            if self._wait_for_download_start(output_path, timeout=120):
+                                success = self._wait_for_download_complete(output_path, timeout=300)
+                                driver.quit()
+                                return success
+
+                except Exception as e:
+                    print(f"⚠️ Right-click method failed: {e}")
+
+
+                print("❌ All download methods failed")
+                driver.quit()
+                return False
+
+            finally:
+                try:
+                    driver.quit()
                 except:
                     pass
 
-            # Check if download is stuck
-            if no_change_count > 30:
-                print("⚠️ Download appears stuck")
+        except Exception as e:
+            print(f"❌ Browser download failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _wait_for_download_start(self, download_path: Path, timeout: int = 30) -> bool:
+        """Wait for download to start (temp file appears)"""
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            # Check for temp download files
+            temp_files = list(download_path.glob('*.crdownload')) + \
+                         list(download_path.glob('*.tmp')) + \
+                         list(download_path.glob('*.part'))
+
+            if temp_files:
+                print(f"✅ Download started")
+                return True
+
+            time.sleep(1)
+
+        return False
+
+    def _wait_for_download_complete(self, download_path: Path, timeout: int = 300) -> bool:
+        """Wait for download to complete"""
+        print("⏳ Waiting for download to complete...")
+        start_time = time.time()
+        last_size = {}
+        no_change_count = 0
+
+        # Get initial files
+        initial_files = set()
+        try:
+            initial_files = {f.name for f in download_path.iterdir() if f.is_file() and f.suffix == '.zip'}
+        except:
+            pass
+
+        while time.time() - start_time < timeout:
+            # Check for temp files
+            temp_files = list(download_path.glob('*.crdownload')) + \
+                         list(download_path.glob('*.tmp')) + \
+                         list(download_path.glob('*.part'))
+
+            if temp_files:
+                # Download in progress
+                for tf in temp_files:
+                    try:
+                        size = tf.stat().st_size
+                        size_mb = size / (1024 * 1024)
+
+                        if tf.name in last_size:
+                            if size == last_size[tf.name]:
+                                no_change_count += 1
+                            else:
+                                no_change_count = 0
+
+                        last_size[tf.name] = size
+                        elapsed = time.time() - start_time
+                        print(f"\r⏳ Downloading: {size_mb:.1f} MB | Elapsed: {elapsed:.0f}s", end='', flush=True)
+                    except:
+                        pass
+
+                # Check if stuck
+                if no_change_count > 30:
+                    print("\n⚠️ Download appears stuck")
+                    return False
+
+                time.sleep(2)
+                continue
+
+            # No temp files - check for completed ZIP
+            try:
+                current_files = {f.name for f in download_path.iterdir() if f.is_file() and f.suffix == '.zip'}
+                new_files = current_files - initial_files
+
+                if new_files:
+                    for filename in new_files:
+                        filepath = download_path / filename
+                        size_mb = filepath.stat().st_size / (1024 * 1024)
+                        elapsed = time.time() - start_time
+
+                        print(f"\n✅ Download completed!")
+                        print(f"📁 File: {filepath}")
+                        print(f"📊 Size: {size_mb:.2f} MB")
+                        print(f"⏱️ Time: {elapsed:.1f}s")
+                        print(f"🚀 Speed: {size_mb / elapsed:.2f} MB/s")
+                        return True
+            except Exception as e:
+                print(f"\n⚠️ Error checking files: {e}")
+
+            time.sleep(2)
+
+        print("\n❌ Download timeout")
+        return False
+
+    def download(self, url: str, output_path: str, force_reauth: bool = False) -> bool:
+        """
+        Main download method with authentication validation
+
+        Args:
+            url: Google Drive URL
+            output_path: Local path to save file(s)
+            force_reauth: Force re-authentication even if session is valid
+
+        Returns:
+            bool: Success status
+        """
+        print("\n" + "=" * 60)
+        print("🚀 GOOGLE DRIVE DOWNLOADER (Backend Mode)")
+        print("=" * 60)
+        print(f"🔗 URL: {url}")
+        print(f"📁 Output: {output_path}")
+        print("=" * 60 + "\n")
+
+        # Ensure output path exists
+        output_path = Path(output_path).resolve()
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # Extract file ID
+        file_id = self._extract_file_id(url)
+        if not file_id:
+            print("❌ Could not extract file ID from URL")
+            return False
+
+        print(f"📋 File ID: {file_id}")
+
+        # Check and validate session
+        session_valid = False
+
+        if not force_reauth and self.cookie_file.exists():
+            print("🔍 Found existing cookie file, validating session...")
+            session_valid = self._validate_session()
+        else:
+            if force_reauth:
+                print("🔄 Force re-authentication requested")
+            else:
+                print("⚠️ No cookie file found")
+
+        # Authenticate if needed
+        if not session_valid:
+            print("🔐 Authentication required")
+            if not self._authenticate_with_browser():
+                print("❌ Authentication failed")
                 return False
 
-            continue
+        # Download based on type
+        is_folder = self._is_folder(url)
 
-        # No temp files - check if new files appeared
-        try:
-            current_files = {f.name for f in download_path.iterdir() if f.is_file()}
-            new_files = current_files - initial_files
+        print(f"\n📦 Detected: {'FOLDER' if is_folder else 'FILE'}")
+        print("⬇️ Starting backend download...\n")
 
-            if new_files:
-                for filename in new_files:
-                    filepath = download_path / filename
-                    size_mb = filepath.stat().st_size / (1024 * 1024)
-                    print(f"✅ Download completed: {filename} ({size_mb:.1f} MB)")
-                return True
-            elif elapsed > 10:
-                print("⚠️ No new files detected yet...")
-
-        except Exception as e:
-            print(f"⚠️ Error checking files: {e}")
-
-        time.sleep(check_interval)
-
-    return False
-
-
-def detect_drive_item_type(driver):
-    """Detect if the current item is a file or folder"""
-    time.sleep(2)
-
-    url = driver.current_url.lower()
-
-    # Check URL patterns first
-    if "/folders/" in url or "/drive/folders/" in url:
-        print("📂 Detected: FOLDER (from URL)")
-        return "folder"
-
-    if "/file/d/" in url or "/file/view" in url:
-        print("📄 Detected: FILE (from URL)")
-        return "file"
-
-    # Check page content
-    page_source = driver.page_source.lower()
-
-    # Look for virus scan warning or preview warnings
-    if any(text in page_source for text in ["can't scan", "couldn't preview", "too large to preview"]):
-        print("📄 Detected: FILE (large file warning)")
-        return "file"
-
-    # Check for download button
-    try:
-        download_btn = driver.find_element(By.XPATH,
-                                           '//button[contains(., "Download")] | //div[@role="button"][contains(., "Download")]')
-        if download_btn:
-            print("📄 Detected: FILE (download button present)")
-            return "file"
-    except:
-        pass
-
-    # Check for folder grid
-    try:
-        grid_items = driver.find_elements(By.CSS_SELECTOR, 'div[role="gridcell"]')
-        if len(grid_items) > 1:
-            print("📂 Detected: FOLDER (multiple items)")
-            return "folder"
-    except:
-        pass
-
-    print("📄 Detected: FILE (default)")
-    return "file"
-
-
-def download_file(driver, download_path):
-    """Download a single file from Google Drive"""
-    print("\n" + "=" * 60)
-    print("📄 DOWNLOADING FILE")
-    print("=" * 60)
-
-    time.sleep(3)
-
-    # Check for virus scan warning
-    try:
-        warning = driver.find_element(By.XPATH,
-                                      "//*[contains(text(), \"can't scan\") or contains(text(), 'too large')]")
-        if warning:
-            print("⚠️ Large file detected - can't be scanned for viruses")
-    except:
-        pass
-
-    # Method 1: Look for download button (primary method for large files)
-    download_selectors = [
-        # Button selectors
-        '//button[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "download")]',
-        '//button[@aria-label="Download"]',
-        'button[aria-label="Download"]',
-
-        # Div with role=button
-        '//div[@role="button"][contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "download")]',
-        'div[role="button"][aria-label="Download"]',
-
-        # Span inside button
-        '//span[contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "download")]/ancestor::button',
-    ]
-
-    print("🔍 Looking for Download button...")
-    for selector in download_selectors:
-        try:
-            if selector.startswith('//'):
-                btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
-                )
-            else:
-                btn = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                )
-
-            if btn:
-                print(f"✅ Found Download button!")
-
-                # Scroll into view
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
-                time.sleep(0.5)
-
-                # Try clicking
-                try:
-                    btn.click()
-                    print("✅ Download button clicked!")
-                except:
-                    driver.execute_script("arguments[0].click();", btn)
-                    print("✅ Download button clicked (via JavaScript)!")
-
-                time.sleep(3)
-
-                # Handle "Download anyway" popup
-                handle_download_anyway_popup(driver)
-
-                return wait_for_download(download_path)
-
-        except TimeoutException:
-            continue
-        except Exception as e:
-            continue
-
-    print("⚠️ Direct download button not found, trying menu options...")
-
-    # Method 2: Three-dot menu
-    try:
-        print("🖱️ Trying three-dot menu...")
-        more_actions = [
-            'div[aria-label="More actions"]',
-            'button[aria-label="More actions"]',
-            '//div[@aria-label="More actions"]',
-            '//button[@aria-label="More actions"]',
-            '//div[@aria-activedescendant][@role="button"]',
-            '//button[@aria-owns]',
-        ]
-
-        for selector in more_actions:
-            try:
-                if selector.startswith('//'):
-                    btn = WebDriverWait(driver, 3).until(
-                        EC.element_to_be_clickable((By.XPATH, selector))
-                    )
-                else:
-                    btn = WebDriverWait(driver, 3).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                    )
-
-                driver.execute_script("arguments[0].scrollIntoView(true);", btn)
-                time.sleep(0.5)
-                btn.click()
-                time.sleep(2)
-
-                # Use enhanced menu detection
-                if find_download_in_menu(driver):
-                    time.sleep(3)
-                    handle_download_anyway_popup(driver)
-                    return wait_for_download(download_path)
-
-            except TimeoutException:
-                continue
-
-    except Exception as e:
-        print(f"⚠️ Three-dot menu failed: {e}")
-
-    # Method 3: Keyboard shortcut
-    try:
-        print("⌨️ Trying keyboard shortcut (Ctrl+S)...")
-        body = driver.find_element(By.TAG_NAME, 'body')
-
-        if platform.system() == "Darwin":
-            ActionChains(driver).key_down(Keys.COMMAND).send_keys('s').key_up(Keys.COMMAND).perform()
+        if is_folder:
+            # Always download folders as ZIP (mimics Google Drive UI)
+            return self._download_folder_as_zip(file_id, output_path)
         else:
-            ActionChains(driver).key_down(Keys.CONTROL).send_keys('s').key_up(Keys.CONTROL).perform()
-
-        time.sleep(3)
-        handle_download_anyway_popup(driver)
-        return wait_for_download(download_path)
-
-    except Exception as e:
-        print(f"⚠️ Keyboard shortcut failed: {e}")
-
-    print("❌ All download methods failed")
-    return False
-
-
-def find_download_in_menu(driver):
-    """
-    Find and click Download option in an open menu by checking aria-activedescendant and aria-owns
-    """
-    try:
-        # Strategy 1: Check for aria-activedescendant on the menu container
-        menu_containers = driver.find_elements(By.XPATH,
-                                               '//div[@role="menu"] | //div[@role="listbox"] | //div[contains(@class, "menu")]')
-
-        for menu in menu_containers:
-            try:
-                # Check aria-activedescendant
-                active_id = menu.get_attribute('aria-activedescendant')
-                if active_id:
-                    print(f"🔍 Found aria-activedescendant: {active_id}")
-
-                # Check aria-owns
-                owns_ids = menu.get_attribute('aria-owns')
-                if owns_ids:
-                    print(f"🔍 Found aria-owns: {owns_ids}")
-                    # Try to find elements by these IDs
-                    for item_id in owns_ids.split():
-                        try:
-                            item = driver.find_element(By.ID, item_id)
-                            if item and 'download' in item.text.lower():
-                                print(f"✅ Found Download option via aria-owns ID: {item_id}")
-                                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", item)
-                                time.sleep(0.3)
-                                try:
-                                    item.click()
-                                except:
-                                    driver.execute_script("arguments[0].click();", item)
-                                return True
-                        except:
-                            continue
-            except:
-                continue
-
-        # Strategy 2: Look for menuitem elements with Download text
-        download_selectors = [
-            '//div[@role="menuitem"][normalize-space()="Download"]',
-            '//div[@role="menuitem"]//span[normalize-space()="Download"]',
-            '//div[@role="menuitem"][contains(translate(., "DOWNLOAD", "download"), "download")]',
-            '//span[text()="Download"]/ancestor::div[@role="menuitem"]',
-        ]
-
-        for selector in download_selectors:
-            try:
-                download_option = WebDriverWait(driver, 3).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
-                )
-                if download_option:
-                    print(f"✅ Found Download option")
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", download_option)
-                    time.sleep(0.3)
-                    try:
-                        download_option.click()
-                    except:
-                        driver.execute_script("arguments[0].click();", download_option)
-                    return True
-            except:
-                continue
-
-        return False
-
-    except Exception as e:
-        print(f"⚠️ Error finding download in menu: {e}")
-        return False
+            return self._download_file_direct(file_id, output_path)
 
 
 def find_and_click_folder(driver, folder_name=".git"):
@@ -736,551 +1246,118 @@ def find_and_click_folder(driver, folder_name=".git"):
         return False
 
 
-def click_three_dot_menu_and_download(driver, download_path):
-    """Click the three-dot menu on selected item and download"""
-    print("🖱️ Looking for three-dot menu or dropdown...")
-
-    try:
-        # After clicking .git folder, we need to click the dropdown arrow
-        # From your HTML: <div class="c-Po a-w-d-aa-zd" aria-hidden="true"><svg...>
-
-        time.sleep(2)
-
-        # Strategy 1: Click the dropdown arrow that's part of the .git button
-        # This should open the menu with Download option
-        dropdown_selectors = [
-            # The SVG arrow inside the dropdown div
-            '//div[@role="button"][@aria-expanded="false"]//svg[@class="a-s-fa-Ha-pa c-qd"]',
-            '//div[@role="button"][@data-tooltip=".git"]//svg',
-            '//div[contains(@class, "c-Po")]//svg',
-            '//div[@aria-hidden="true"]//svg',
-            # Try the parent div
-            '//div[@role="button"][@data-tooltip=".git"]//div[contains(@class, "c-Po")]',
-            '//div[@role="button"][@aria-expanded="false"]//div[@aria-hidden="true"]',
-        ]
-
-        dropdown_opened = False
-        for selector in dropdown_selectors:
-            try:
-                element = WebDriverWait(driver, 3).until(
-                    EC.presence_of_element_located((By.XPATH, selector))
-                )
-
-                if element:
-                    print(f"✅ Found dropdown element")
-
-                    # Scroll into view
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
-                    time.sleep(0.5)
-
-                    # Try clicking the element or its parent
-                    click_target = element
-                    try:
-                        # Try to get parent button if this is the SVG
-                        parent = element.find_element(By.XPATH, './ancestor::div[@role="button"]')
-                        click_target = parent
-                    except:
-                        pass
-
-                    # Click
-                    try:
-                        click_target.click()
-                        print("✅ Clicked dropdown")
-                    except:
-                        driver.execute_script("arguments[0].click();", click_target)
-                        print("✅ Clicked dropdown (via JavaScript)")
-
-                    dropdown_opened = True
-                    time.sleep(2)
-                    break
-
-            except TimeoutException:
-                continue
-
-        # Strategy 2: If the element has aria-expanded, it might expand when clicked
-        # Try clicking the .git button itself again to expand it
-        if not dropdown_opened:
-            print("⚠️ Trying to re-click .git button to expand menu...")
-            try:
-                git_button = driver.find_element(By.XPATH,
-                                                 '//div[@role="button"][@data-tooltip=".git"]')
-
-                if git_button:
-                    # Check if it's not expanded
-                    expanded = git_button.get_attribute('aria-expanded')
-                    if expanded == 'false' or not expanded:
-                        driver.execute_script("arguments[0].click();", git_button)
-                        print("✅ Re-clicked .git button")
-                        dropdown_opened = True
-                        time.sleep(2)
-            except:
-                pass
-
-        # Strategy 3: Look for standard three-dot menu button
-        if not dropdown_opened:
-            print("⚠️ Trying standard three-dot menu...")
-            more_actions_selectors = [
-                'div[aria-label="More actions"]',
-                'button[aria-label="More actions"]',
-                '//div[@aria-label="More actions"]',
-                '//button[@aria-label="More actions"]',
-                # Near .git element
-                '//div[@data-tooltip=".git"]//following::div[@aria-label="More actions"][1]',
-                '//div[@data-tooltip=".git"]//parent::*//*[@aria-label="More actions"]',
-            ]
-
-            for selector in more_actions_selectors:
-                try:
-                    if selector.startswith('//'):
-                        menu_button = WebDriverWait(driver, 3).until(
-                            EC.element_to_be_clickable((By.XPATH, selector))
-                        )
-                    else:
-                        menu_button = WebDriverWait(driver, 3).until(
-                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                        )
-
-                    if menu_button:
-                        print("✅ Found three-dot menu")
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", menu_button)
-                        time.sleep(0.5)
-
-                        try:
-                            menu_button.click()
-                        except:
-                            driver.execute_script("arguments[0].click();", menu_button)
-
-                        print("✅ Opened three-dot menu")
-                        dropdown_opened = True
-                        time.sleep(2)
-                        break
-
-                except TimeoutException:
-                    continue
-
-        if not dropdown_opened:
-            print("❌ Could not open dropdown menu")
-            # Debug: Take screenshot if possible
-            try:
-                driver.save_screenshot("debug_no_dropdown.png")
-                print("📸 Screenshot saved to debug_no_dropdown.png")
-            except:
-                pass
-            return False
-
-        # Now find and click Download option in the menu
-        print("🔍 Looking for Download option in menu...")
-
-        # Wait a moment for menu to fully appear
-        time.sleep(1)
-
-        download_selectors = [
-            # Standard menuitem with Download text
-            '//div[@role="menuitem"][normalize-space()="Download"]',
-            '//div[@role="menuitem"]//span[normalize-space()="Download"]',
-            '//div[@role="menuitem"]//span[text()="Download"]',
-            '//div[@role="menuitem"][contains(., "Download")]',
-            '//span[text()="Download"]/ancestor::div[@role="menuitem"]',
-            '//div[@role="menu"]//span[contains(., "Download")]',
-            # Broader search
-            '//div[@role="menuitem"]',  # Get all menu items and filter
-            '//span[text()="Download"]',
-            '//div[text()="Download"]',
-            # Case insensitive
-            '//div[@role="menuitem"][contains(translate(., "DOWNLOAD", "download"), "download")]',
-        ]
-
-        for selector in download_selectors:
-            try:
-                if selector == '//div[@role="menuitem"]':
-                    # Special case: get all menu items
-                    items = driver.find_elements(By.XPATH, selector)
-                    for item in items:
-                        try:
-                            if 'download' in item.text.lower():
-                                print(f"✅ Found Download in menu item: {item.text}")
-
-                                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", item)
-                                time.sleep(0.3)
-
-                                try:
-                                    item.click()
-                                except:
-                                    driver.execute_script("arguments[0].click();", item)
-
-                                print("✅ Clicked Download option")
-                                time.sleep(0.3)
-
-                                handle_download_anyway_popup(driver)
-                                return wait_for_download(download_path)
-                        except:
-                            continue
-                else:
-                    download_option = WebDriverWait(driver, 5).until(
-                        EC.element_to_be_clickable((By.XPATH, selector))
-                    )
-
-                    if download_option:
-                        print(f"✅ Found Download option")
-
-                        # Highlight
-                        try:
-                            driver.execute_script("arguments[0].style.backgroundColor='yellow'", download_option)
-                        except:
-                            pass
-
-                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", download_option)
-                        time.sleep(0.5)
-
-                        try:
-                            download_option.click()
-                        except:
-                            driver.execute_script("arguments[0].click();", download_option)
-
-                        print("✅ Clicked Download option")
-                        time.sleep(3)
-
-                        handle_download_anyway_popup(driver)
-                        return wait_for_download(download_path)
-
-            except TimeoutException:
-                continue
-            except Exception as e:
-                continue
-
-        # Debug: Print what we can see
-        print("\n⚠️ DEBUG: Could not find Download option")
-        try:
-            # Try to find any visible text that might be the menu
-            visible_text = driver.find_elements(By.XPATH, '//*[contains(text(), "")]')
-            print(f"Visible elements: {len(visible_text)}")
-
-            menu_items = driver.find_elements(By.XPATH, '//div[@role="menuitem"] | //div[@role="menu"]//*')
-            if menu_items:
-                print(f"Found {len(menu_items)} menu items:")
-                for item in menu_items[:10]:
-                    try:
-                        text = item.text.strip()
-                        if text:
-                            print(f"  - {text}")
-                    except:
-                        pass
-
-            # Take screenshot for debugging
-            driver.save_screenshot("debug_menu_opened.png")
-            print("📸 Screenshot saved to debug_menu_opened.png")
-        except Exception as e:
-            print(f"Debug info failed: {e}")
-
-        return False
-
-    except Exception as e:
-        print(f"❌ Error using dropdown menu: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def download_folder(driver, download_path):
-    """Download entire folder from Google Drive"""
-    print("\n" + "=" * 60)
-    print("📂 DOWNLOADING FOLDER")
-    print("=" * 60)
-
-    try:
-        # Wait for folder contents - try multiple element types
-        print("⏳ Waiting for folder contents...")
-        loaded = False
-
-        for selector in ['div[role="gridcell"]', 'div[role="button"]', 'div[data-tooltip]', 'div.h-sb-Ic']:
-            try:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, selector))
-                )
-                print(f"✅ Folder contents loaded ({selector})")
-                loaded = True
-                break
-            except TimeoutException:
-                continue
-
-        if not loaded:
-            print("❌ Could not detect folder contents")
-            return False
-
-        time.sleep(3)
-
-        # Check if we need to find and click a specific folder (like .git)
-        # First check if .git folder exists in current view
-        git_folder_exists = False
-
-        try:
-            # Try to find .git using the HTML structure from your example
-            git_element = driver.find_element(By.XPATH,
-                                              '//div[@role="button"][@data-tooltip=".git"] | '
-                                              '//div[@data-tooltip=".git"] | '
-                                              '//div[@aria-label=".git"]')
-
-            if git_element:
-                git_folder_exists = True
-                print("📂 Detected .git folder in current view")
-        except NoSuchElementException:
-            print("ℹ️ No .git folder detected")
-
-        # If .git exists, click it and download via three-dot menu
-        if git_folder_exists:
-            print("📂 Attempting to download .git folder specifically...")
-            if find_and_click_folder(driver, ".git"):
-                time.sleep(2)
-                return click_three_dot_menu_and_download(driver, download_path)
-            else:
-                print("⚠️ Failed to click .git, trying default method...")
-
-        # Default behavior: Try to select all and download
-        # But first check if we have gridcells (standard Drive view)
-        try:
-            gridcells = driver.find_elements(By.CSS_SELECTOR, 'div[role="gridcell"]')
-
-            if len(gridcells) > 0:
-                print(f"ℹ️ Found {len(gridcells)} items in standard grid view")
-                print("🖱️ Selecting all items...")
-
-                # Select all
-                if platform.system() == "Darwin":
-                    ActionChains(driver).key_down(Keys.COMMAND).send_keys('a').key_up(Keys.COMMAND).perform()
-                else:
-                    ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
-
-                time.sleep(2)
-
-                # Right-click on first item
-                print("⬇️ Opening context menu...")
-                try:
-                    first_item = driver.find_element(By.CSS_SELECTOR, 'div[role="gridcell"][aria-selected="true"]')
-                except:
-                    first_item = gridcells[0]
-
-                ActionChains(driver).context_click(first_item).perform()
-                time.sleep(2)
-
-                # Click Download
-                download_item = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH,
-                                                '//div[@role="menuitem"][contains(., "Download")]'))
-                )
-                download_item.click()
-                time.sleep(3)
-
-                handle_download_anyway_popup(driver)
-                return wait_for_download(download_path)
-            else:
-                print("⚠️ No standard gridcells found, folder may have different view")
-
-                # Try alternative: look for any clickable items
-                clickable_items = driver.find_elements(By.CSS_SELECTOR, 'div[role="button"][data-tooltip]')
-                if len(clickable_items) > 0:
-                    print(f"ℹ️ Found {len(clickable_items)} clickable items")
-
-                    # If there's only one item and it's .git, download it
-                    if len(clickable_items) == 1:
-                        item = clickable_items[0]
-                        tooltip = item.get_attribute('data-tooltip')
-                        if tooltip == '.git':
-                            print("📂 Single .git folder detected, downloading it...")
-                            item.click()
-                            time.sleep(2)
-                            return click_three_dot_menu_and_download(driver, download_path)
-
-                    # Otherwise select all and try to download
-                    print("🖱️ Attempting to select all items...")
-                    if platform.system() == "Darwin":
-                        ActionChains(driver).key_down(Keys.COMMAND).send_keys('a').key_up(Keys.COMMAND).perform()
-                    else:
-                        ActionChains(driver).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).perform()
-
-                    time.sleep(2)
-
-                    # Try right-click on first item
-                    ActionChains(driver).context_click(clickable_items[0]).perform()
-                    time.sleep(2)
-
-                    # Click Download
-                    download_item = WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH,
-                                                    '//div[@role="menuitem"][contains(., "Download")] | '
-                                                    '//span[text()="Download"]/ancestor::div[@role="menuitem"]'))
-                    )
-                    download_item.click()
-                    time.sleep(3)
-
-                    handle_download_anyway_popup(driver)
-                    return wait_for_download(download_path)
-                else:
-                    print("❌ Could not find any items to download")
-                    return False
-
-        except Exception as e:
-            print(f"❌ Error in default download method: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    except Exception as e:
-        print(f"❌ Folder download failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def download_from_drive(google_drive_link: str, download_path: str,
-                        cookie_file: Path = COOKIE_FILE, profile_path: str = None,
-                        headless: bool = False, reuse_driver: bool = True):
+# Convenience functions
+def download_from_drive(url: str, output_path: str,
+                        cookie_file: Path = COOKIE_FILE,
+                        force_reauth: bool = False) -> bool:
     """
-    Main function to download files/folders from Google Drive
+    Download file or folder from Google Drive
 
     Args:
-        google_drive_link: Google Drive URL
-        download_path: Local path to save files
+        url: Google Drive URL
+        output_path: Local path to save file(s)
         cookie_file: Path to cookie file for session persistence
-        profile_path: Chrome profile path for persistent login
-        headless: Run in headless mode
-        reuse_driver: Reuse browser instance across multiple calls (recommended)
+        force_reauth: Force re-authentication
+
+    Returns:
+        bool: Success status
     """
-    global _SHARED_DRIVER
+    downloader = GoogleDriveDownloader(cookie_file=cookie_file)
+    return downloader.download(url, output_path, force_reauth=force_reauth)
 
-    # Validate inputs
-    if not google_drive_link or not google_drive_link.startswith("http"):
-        raise ValueError("❌ Invalid Google Drive link")
 
-    # Ensure download path exists and is absolute
-    download_path = str(Path(download_path).resolve())
-    os.makedirs(download_path, exist_ok=True)
+def batch_download(urls: list, output_path: str,
+                   cookie_file: Path = COOKIE_FILE) -> Dict[str, bool]:
+    """
+    Download multiple files/folders from Google Drive
+
+    Args:
+        urls: List of Google Drive URLs
+        output_path: Local path to save file(s)
+        cookie_file: Path to cookie file for session persistence
+
+    Returns:
+        dict: Dictionary mapping URLs to success status
+    """
+    downloader = GoogleDriveDownloader(cookie_file=cookie_file)
+    results = {}
 
     print("\n" + "=" * 60)
-    print("🚀 GOOGLE DRIVE DOWNLOADER")
+    print("📦 BATCH DOWNLOAD MODE")
     print("=" * 60)
-    print(f"📁 Download path: {download_path}")
-    print(f"🔗 Link: {google_drive_link}")
+    print(f"📊 Total items: {len(urls)}")
     print("=" * 60 + "\n")
 
-    # Use shared driver if reuse is enabled and driver exists
-    if reuse_driver and _SHARED_DRIVER:
-        driver = _SHARED_DRIVER
-        print("♻️ Reusing existing browser session\n")
-    else:
-        driver = get_webdriver(download_path, profile_path, headless)
+    for i, url in enumerate(urls, 1):
+        print(f"\n📥 Download {i}/{len(urls)}")
+        print("-" * 60)
+        results[url] = downloader.download(url, output_path)
 
-        # Load cookies if not using profile
-        if cookie_file and not profile_path:
-            load_cookies(driver, cookie_file)
+        if i < len(urls):
+            print("\n⏳ Waiting 3 seconds before next download...")
+            time.sleep(3)
 
-        # Save driver for reuse
-        if reuse_driver:
-            _SHARED_DRIVER = driver
+    # Summary
+    print("\n" + "=" * 60)
+    print("📊 BATCH DOWNLOAD SUMMARY")
+    print("=" * 60)
+    success_count = sum(1 for v in results.values() if v)
+    print(f"✅ Successful: {success_count}/{len(urls)}")
+    print(f"❌ Failed: {len(urls) - success_count}/{len(urls)}")
+    print("=" * 60)
 
-    try:
-        # Navigate to link
-        print(f"🌐 Navigating to link...")
-        driver.get(google_drive_link)
-        time.sleep(4)
-
-        # Check login (only prompt if really needed)
-        if not is_logged_in_drive(driver, timeout=10):
-            print("\n" + "=" * 60)
-            print("🔐 GOOGLE LOGIN REQUIRED")
-            print("=" * 60)
-            input("➡️ Please log in and press ENTER...")
-
-            if not is_logged_in_drive(driver, timeout=30):
-                print("❌ Login failed")
-                return False
-
-            if not profile_path:
-                save_cookies(driver, cookie_file)
-
-            print("✅ Login successful!\n")
-        else:
-            print("✅ Already logged in\n")
-
-        # Detect and download
-        item_type = detect_drive_item_type(driver)
-
-        success = False
-        if item_type == "folder":
-            success = download_folder(driver, download_path)
-        else:
-            success = download_file(driver, download_path)
-
-        # Status
-        print("\n" + "=" * 60)
-        if success:
-            print("✅ DOWNLOAD COMPLETED!")
-        else:
-            print("⚠️ DOWNLOAD MAY HAVE ISSUES")
-        print("=" * 60 + "\n")
-
-        return success
-
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-
-def close_driver():
-    """Close the shared driver (call this when done with all downloads)"""
-    global _SHARED_DRIVER
-    if _SHARED_DRIVER:
-        print("\n🔒 Closing browser...")
-        try:
-            _SHARED_DRIVER.quit()
-            _SHARED_DRIVER = None
-            print("✅ Browser closed")
-        except:
-            pass
+    return results
 
 
 # Example usage
 if __name__ == "__main__":
-    # Example for multiple downloads
     print("\n" + "=" * 60)
-    print("GOOGLE DRIVE BATCH DOWNLOADER")
+    print("GOOGLE DRIVE BACKEND DOWNLOADER v2.4")
     print("=" * 60)
+    print("Features:")
+    print("  ✅ Cookie-based session validation")
+    print("  ✅ Automatic re-authentication")
+    print("  ✅ Backend downloads (no browser)")
+    print("  ✅ Large file support (900MB+)")
+    print("  ✅ Virus scan warning handler")
+    print("  ✅ Progress tracking with ETA")
+    print("  ✅ Folder download with session reuse")
+    print("  ✅ Improved cookie loading (critical auth cookies)")
+    print("  ✅ Reuse authenticated browser (no session loss)")
+    print("  ✅ Extended wait times & retry logic")
+    print("=" * 60 + "\n")
 
-    # Option 1: Single download
-    link = input("\n📎 Enter Google Drive link (or press Enter to skip): ").strip()
+    # Single download
+    choice = input("Choose mode:\n1. Single download\n2. Batch download\n3. Force re-authenticate\n> ").strip()
 
-    if link:
-        download_path = input("📁 Enter download path: ").strip() or "./downloads"
-        download_from_drive(link, download_path)
-        close_driver()
+    if choice == "1":
+        url = input("\n📎 Enter Google Drive URL: ").strip()
+        output = input("📁 Enter output path (default: ./downloads): ").strip() or "./downloads"
+
+        if url:
+            success = download_from_drive(url, output)
+            print(f"\n{'✅ Success!' if success else '❌ Failed!'}")
+
+    elif choice == "2":
+        print("\n📋 Enter URLs (one per line, empty line to finish):")
+        urls = []
+        while True:
+            url = input().strip()
+            if not url:
+                break
+            urls.append(url)
+
+        if urls:
+            output = input("\n📁 Enter output path (default: ./downloads): ").strip() or "./downloads"
+            results = batch_download(urls, output)
+
+    elif choice == "3":
+        url = input("\n📎 Enter Google Drive URL: ").strip()
+        output = input("📁 Enter output path (default: ./downloads): ").strip() or "./downloads"
+
+        if url:
+            success = download_from_drive(url, output, force_reauth=True)
+            print(f"\n{'✅ Success!' if success else '❌ Failed!'}")
+
     else:
-        # Option 2: Multiple downloads (like your use case)
-        print("\n📋 Example: Multiple downloads")
-        print("-" * 60)
-
-        base_dir = "./downloads"
-
-        tar_link = input("📎 Enter tar file link: ").strip()
-        git_folder_link = input("📎 Enter folder link: ").strip()
-
-        if tar_link and git_folder_link:
-            print("\n🚀 Starting batch download...\n")
-
-            # Download 1
-            print("📥 Download 1/2: TAR file")
-            success1 = download_from_drive(tar_link, base_dir, reuse_driver=True)
-
-            # Download 2 (reuses same browser)
-            print("\n📥 Download 2/2: Folder")
-            success2 = download_from_drive(git_folder_link, base_dir, reuse_driver=True)
-
-            # Close browser when done
-            close_driver()
-
-            print("\n" + "=" * 60)
-            print("📊 BATCH DOWNLOAD SUMMARY")
-            print("=" * 60)
-            print(f"TAR file: {'✅ Success' if success1 else '❌ Failed'}")
-            print(f"Folder: {'✅ Success' if success2 else '❌ Failed'}")
-            print("=" * 60)
+        print("❌ Invalid choice")
