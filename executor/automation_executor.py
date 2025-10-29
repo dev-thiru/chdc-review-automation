@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 import subprocess
@@ -394,11 +395,6 @@ def operation_gemini_evaluate(
         for idx, row in review_checklist_df.iterrows():
             print(f"[llm] Evaluating row {idx + 1}/{total_rows}")
 
-            input_type = str(row.get('Input Type', '')).strip()
-            if input_type == 'file':
-                deferred_rows.append(idx)
-                continue  # skip for now
-
             # Extract checkpoint information
             topic = str(row.get('Topics', '')) if not pd.isna(row.get('Topics')) else ''
             checkpoint = str(row.get('CheckPoints', '')) if not pd.isna(row.get('CheckPoints')) else ''
@@ -411,15 +407,25 @@ def operation_gemini_evaluate(
             if not checkpoint.strip() or not system_prompt.strip():
                 continue
             input_data = "No specific input data provided"
-
-            if input_type.strip() and input_type.strip() == 'csv':
-                input_data = input_df.iloc[0].get(input_field.strip(), None)
+            defer_due_to_field_type = False
 
             if input_cumulative.strip() and input_cumulative.strip() != '':
                 if isinstance(input_cumulative, str):
+
                     input_cumulative = re.sub(r'(\bfield\b|\bfield_type\b)\s*:', r'"\1":', input_cumulative)
-                    input_cumulative = input_cumulative.replace("'", '"')
-                    input_cumulative = json.loads(input_cumulative)
+                    input_cumulative = ast.literal_eval(input_cumulative)
+
+                    # Check if any field_type is file or patch
+                    for item in input_cumulative:
+                        if isinstance(item, dict) and "field_type" in item:
+                            if str(item["field_type"]).strip().lower() in ("file", "patch"):
+                                defer_due_to_field_type = True
+                                break
+
+                    if defer_due_to_field_type:
+                        deferred_rows.append(idx)
+                        continue
+                        # Skip processing for now
                     input_data = [
                         {
                             item["field"].strip(): input_df.iloc[0].get(item["field"].strip(), None)
@@ -431,16 +437,6 @@ def operation_gemini_evaluate(
             task_id = input_df.iloc[0].get("Task_id".strip(), None)
             project_root = Path(__file__).parent.parent
             logs_path = project_root / "output" / str(task_id)
-
-            if input_type.strip() and input_type.strip() == 'file':
-                file_path = logs_path / "execution" / f"{input_type.strip()}.log"
-                if file_path.exists() and file_path.is_file():
-                    # Read the file content
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        input_data = f.read()
-                else:
-                    # File not found, fallback
-                    input_data = None
 
             # Build checkpoint text
             checkpoint_text = f"Topic: {topic}\nCheckpoint: {checkpoint}"
@@ -483,22 +479,54 @@ def operation_gemini_evaluate(
                 checkpoint_text = f"Topic: {row.get('Topics', '')}\nCheckpoint: {row.get('CheckPoints', '')}"
                 input_field = str(row.get('Input', '')).strip()
 
-                input_data = None
-                input_type = str(row.get('Input Type', '')).strip()
-                if input_type == 'file':
-                    # Read Docker-generated log file
-                    file_path = logs_path / "execution" / f"{input_field.strip()}.log"
-                    if file_path.exists() and file_path.is_file():
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            input_data = f.read()
-                    else:
-                        input_data = None
+                input_data = {}  # <- IMPORTANT: We now store MULTIPLE data sources
+
+                # Parse input_cumulative safely
+                input_cumulative = str(row.get('Input Cumulative', '')).strip()
+                if input_cumulative:
+                    input_cumulative = re.sub(r'(\bfield\b|\bfield_type\b)\s*:', r'"\1":', input_cumulative)
+                    try:
+                        input_cumulative = ast.literal_eval(input_cumulative)
+                    except Exception:
+                        input_cumulative = []
+
+                # Loop through each item, load files accordingly
+                for item in input_cumulative:
+                    if not (isinstance(item, dict) and "field" in item and "field_type" in item):
+                        continue
+
+                    field_name = str(item["field"]).strip()
+                    field_type = str(item["field_type"]).strip().lower()
+
+                    if not field_name:
+                        continue
+
+                    if field_type == "csv":
+                        input_data[field_name] = input_df.iloc[0].get(item["field"].strip())
+
+                    # --- If field_type is file ---> load .log file ---
+                    if field_type == "file":
+                        file_path = logs_path / "execution" / f"{field_name}.log"
+                        if file_path.exists() and file_path.is_file():
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                input_data[field_name] = f.read()
+                        else:
+                            input_data[field_name] = None
+
+                    # --- If field_type is patch ---> load .patch file ---
+                    elif field_type == "patch":
+                        file_path = logs_path / "patch" / f"{field_name}.patch"
+                        if file_path.exists() and file_path.is_file():
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                input_data[field_name] = f.read()
+                        else:
+                            input_data[field_name] = None
 
                 evaluation = call_gemini_with_prompt(system_prompt, checkpoint_text, input_data, gemini_api_key)
                 review_checklist_df.at[idx, 'Followed'] = evaluation['followed']
                 review_checklist_df.at[idx, 'LLM Comments'] = evaluation['comment']
 
-        columns_to_remove = ["System Prompt", "Input Type", "Input"]
+        columns_to_remove = ["System Prompt", "Input Type", "Input", "Input Cumulative"]
         review_checklist_df = review_checklist_df.drop(columns=columns_to_remove, errors='ignore')
 
         # Save the updated CSV
@@ -520,7 +548,8 @@ def operation_gemini_evaluate(
         return result
 
 
-def call_gemini_with_prompt(system_prompt: str, checkpoint_text: str, input_data: str, api_key: str
+def call_gemini_with_prompt(system_prompt: str, checkpoint_text: str, input_data: str | dict[str, str | None],
+                            api_key: str
                             ) -> Dict[str, str]:
     """
     Calls Gemini API with system prompt and checkpoint information.
@@ -533,7 +562,7 @@ def call_gemini_with_prompt(system_prompt: str, checkpoint_text: str, input_data
         api_key: Gemini API key
     """
     try:
-        gemini_api_endpoint: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key="
+        gemini_api_endpoint: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key="
         # Build the full endpoint URL
         full_endpoint = f"{gemini_api_endpoint}{api_key}"
 

@@ -13,6 +13,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from drive.folder import FolderDownloader
+
 # Configuration
 COOKIE_FILE = Path.home() / ".drive_selenium_cookies.json"
 SESSION_FILE = Path.home() / ".drive_session_info.json"
@@ -519,33 +521,48 @@ class GoogleDriveDownloader:
             return False
 
     def _try_backend_folder_download(self, folder_id: str, output_path: Path) -> bool:
-        """Try to download folder via backend API (may not work for all folders)"""
+        """Use Selenium to extract files, then download via backend"""
         try:
-            print(f"🔗 Attempting backend ZIP download...")
+            print(f"🔗 Attempting folder download...")
 
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Referer': f'https://drive.google.com/drive/folders/{folder_id}',
-            }
+            # Setup browser if needed
+            if not hasattr(self, 'driver') or not self.driver:
+                from webdriver_manager.chrome import ChromeDriverManager
+                from selenium.webdriver.chrome.service import Service
 
-            # Try direct download endpoint
-            url = f'https://drive.google.com/drive/folders/{folder_id}/download'
-            response = self.session.get(url, headers=headers, stream=True, timeout=30, allow_redirects=True)
+                options = webdriver.ChromeOptions()
+                options.add_argument("--start-maximized")
+                options.add_argument("--disable-blink-features=AutomationControlled")
+                options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
-            content_type = response.headers.get('Content-Type', '').lower()
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=options)
 
-            # Check if we got actual ZIP data
-            if 'application/zip' in content_type or 'application/x-zip' in content_type:
-                # We got a ZIP file!
-                return self._save_zip_response(response, folder_id, output_path)
+                driver.get("https://www.google.com")
+                time.sleep(2)
 
-            # If HTML, backend method won't work
-            return False
+                if not self._load_cookies_to_browser(driver):
+                    driver.quit()
+                    return False
+
+                driver.get("https://drive.google.com/drive/my-drive")
+                time.sleep(5)
+
+                if 'accounts.google.com' in driver.current_url.lower():
+                    driver.quit()
+                    return False
+
+                self.driver = driver
+            else:
+                driver = self.driver
+
+            downloader = FolderDownloader(self.session)
+            downloader.print_summary()
+
+            return success and len(downloader.downloaded_files) > 0
 
         except Exception as e:
-            print(f"⚠️ Backend method failed: {e}")
+            print(f"❌ Error: {e}")
             return False
 
     def _save_zip_response(self, response, folder_id: str, output_path: Path) -> bool:
@@ -915,9 +932,9 @@ class GoogleDriveDownloader:
                                 time.sleep(0.3)
 
                                 active = driver.switch_to.active_element
-                                active.send_keys(Keys.ARROW_DOWN)   # Move to Download option
+                                active.send_keys(Keys.ARROW_DOWN)  # Move to Download option
                                 time.sleep(0.3)
-                                active.send_keys(Keys.ENTER)        # Confirm
+                                active.send_keys(Keys.ENTER)  # Confirm
                                 print("✅ Download triggered via keyboard keys")
                                 download_found = True
                                 print("✅ Clicked Download option")
@@ -933,7 +950,6 @@ class GoogleDriveDownloader:
 
                 except Exception as e:
                     print(f"⚠️ Right-click method failed: {e}")
-
 
                 print("❌ All download methods failed")
                 driver.quit()
