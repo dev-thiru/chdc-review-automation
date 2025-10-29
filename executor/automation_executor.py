@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import threading
 import time
@@ -403,16 +404,29 @@ def operation_gemini_evaluate(
             checkpoint = str(row.get('CheckPoints', '')) if not pd.isna(row.get('CheckPoints')) else ''
             input_field = str(row.get('Input', '')) if not pd.isna(row.get('Input')) else ''
             input_type = str(row.get('Input Type', '')) if not pd.isna(row.get('Input Type')) else ''
+            input_cumulative = str(row.get('Input Cumulative', '')) if not pd.isna(row.get('Input Cumulative')) else ''
             system_prompt = str(row.get('System Prompt', '')) if not pd.isna(row.get('System Prompt')) else ''
 
             # Skip rows without checkpoints or system prompts
             if not checkpoint.strip() or not system_prompt.strip():
-                print(f"[llm] Skipping row {idx} - missing checkpoint or system prompt")
                 continue
             input_data = "No specific input data provided"
 
             if input_type.strip() and input_type.strip() == 'csv':
                 input_data = input_df.iloc[0].get(input_field.strip(), None)
+
+            if input_cumulative.strip() and input_cumulative.strip() != '':
+                if isinstance(input_cumulative, str):
+                    input_cumulative = re.sub(r'(\bfield\b|\bfield_type\b)\s*:', r'"\1":', input_cumulative)
+                    input_cumulative = input_cumulative.replace("'", '"')
+                    input_cumulative = json.loads(input_cumulative)
+                    input_data = [
+                        {
+                            item["field"].strip(): input_df.iloc[0].get(item["field"].strip(), None)
+                        }
+                        for item in input_cumulative
+                        if isinstance(item, dict) and "field" in item and item["field"].strip()
+                    ]
 
             task_id = input_df.iloc[0].get("Task_id".strip(), None)
             project_root = Path(__file__).parent.parent
@@ -430,8 +444,6 @@ def operation_gemini_evaluate(
 
             # Build checkpoint text
             checkpoint_text = f"Topic: {topic}\nCheckpoint: {checkpoint}"
-            # Get corresponding input data
-            print(f"{input_data}")
 
             if input_field.strip() and input_field != 'NA':
                 # Try to find matching data in input CSV
@@ -463,6 +475,7 @@ def operation_gemini_evaluate(
         if deferred_rows and docker_completed_event and logs_path:
             print("[llm] Waiting for Docker to finish for file-based input...")
             docker_completed_event.wait()  # BLOCK until Docker completes
+            print("[llm] Docker execution completed now to evaluate for file-based input...")
 
             for idx in deferred_rows:
                 row = review_checklist_df.loc[idx]
@@ -520,28 +533,27 @@ def call_gemini_with_prompt(system_prompt: str, checkpoint_text: str, input_data
         api_key: Gemini API key
     """
     try:
-        gemini_api_endpoint: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key="
+        gemini_api_endpoint: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key="
         # Build the full endpoint URL
         full_endpoint = f"{gemini_api_endpoint}{api_key}"
 
         # Build the evaluation prompt
         evaluation_prompt = f"""
-{system_prompt}
 
-Checkpoint to evaluate:
-{checkpoint_text}
+Evaluation Guideline:
+{system_prompt}
 
 Input/Evidence provided:
 {input_data}
 
-Based on the checkpoint requirements and the provided evidence, evaluate whether this checkpoint was followed correctly.
+Based on the Evaluation Guideline and the Input/Evidence provided, evaluate whether this checkpoint was followed correctly.
 
 Respond in this exact format:
 FOLLOWED: [Yes/No]
 COMMENT: [Brief explanation of your evaluation in 1-2 sentences]
 
 Important point to consider : 
-The provided Input/Evidence can be text or drive link so evaluate accordingly
+The provided Input/Evidence can be text or drive link or combination of multiple values so evaluate accordingly
 """
 
         print(f"Calling with prompt length: {len(evaluation_prompt)} characters")
