@@ -265,60 +265,6 @@ def operation_docker(
 
 # --------------------------- Operation 2: Gemini LLM Review ---------------------------
 
-def call_gemini(prompt: str, token: str, endpoint: str, timeout: int = 60, temperature: float = 0.1) -> str:
-    """
-    Gemini-compatible LLM call based on the provided Apps Script reference.
-
-    Args:
-        prompt (str): The input text prompt to send to the Gemini model.
-        token (str): The Gemini API key (Bearer token).
-        endpoint (str): The full Gemini API endpoint (without the key if using Authorization header).
-        timeout (int): Request timeout in seconds.
-        temperature (float): Sampling temperature for generation.
-    """
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
-    # Match the structure of the nlData object from Apps Script
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": temperature
-        },
-        "safetySettings": [
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-        ]
-    }
-
-    try:
-        resp = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Parse the Gemini-style response
-        if "candidates" in data:
-            c = data["candidates"][0]
-            if "content" in c and "parts" in c["content"] and c["content"]["parts"]:
-                return c["content"]["parts"][0].get("text", "")
-        # Fallback if structure changes
-        return json.dumps(data, indent=2)
-
-    except Exception as e:
-        return f"__ERROR__ calling Gemini API: {e}"
-
-
 def get_gemini_api_token():
     """Fetch llm api token from Google Sheets config."""
     configuration_df = pd.DataFrame()
@@ -393,15 +339,21 @@ def operation_gemini_evaluate(
         logs_path = ""
 
         for idx, row in review_checklist_df.iterrows():
-            print(f"[llm] Evaluating row {idx + 1}/{total_rows}")
+
+            query_point_2 = input_df.iloc[0].get("QP2 - Query Point".strip())
+            query_point_3 = input_df.iloc[0].get("QP3 - Query Point".strip())
+            if query_point_2 in ("N/A", "", "nan", None) and idx >= 71:
+                continue
+
+            if query_point_3 in ("N/A", "", "nan", None) and idx >= 111:
+                continue
 
             # Extract checkpoint information
             topic = str(row.get('Topics', '')) if not pd.isna(row.get('Topics')) else ''
             checkpoint = str(row.get('CheckPoints', '')) if not pd.isna(row.get('CheckPoints')) else ''
-            input_field = str(row.get('Input', '')) if not pd.isna(row.get('Input')) else ''
-            input_type = str(row.get('Input Type', '')) if not pd.isna(row.get('Input Type')) else ''
             input_cumulative = str(row.get('Input Cumulative', '')) if not pd.isna(row.get('Input Cumulative')) else ''
             system_prompt = str(row.get('System Prompt', '')) if not pd.isna(row.get('System Prompt')) else ''
+            print(f"[llm] Evaluating for {checkpoint}")
 
             # Skip rows without checkpoints or system prompts
             if not checkpoint.strip() or not system_prompt.strip():
@@ -428,7 +380,7 @@ def operation_gemini_evaluate(
                         # Skip processing for now
                     input_data = [
                         {
-                            item["field"].strip(): input_df.iloc[0].get(item["field"].strip(), None)
+                            item["field"].strip(): input_df.iloc[0].get(item["field"].strip(), "N/A")
                         }
                         for item in input_cumulative
                         if isinstance(item, dict) and "field" in item and item["field"].strip()
@@ -441,16 +393,6 @@ def operation_gemini_evaluate(
             # Build checkpoint text
             checkpoint_text = f"Topic: {topic}\nCheckpoint: {checkpoint}"
 
-            if input_field.strip() and input_field != 'NA':
-                # Try to find matching data in input CSV
-                if idx < len(input_df):
-                    input_row = input_df.iloc[idx]
-                    input_data = f"Input Field Required: {input_field}\n"
-                    input_data += "\n".join([f"{col}: {val}" for col, val in input_row.items()
-                                             if not pd.isna(val)])
-                else:
-                    input_data = f"Input Field Required: {input_field}\n(No corresponding input row found)"
-
             # Call Gemini API
             evaluation = call_gemini_with_prompt(
                 system_prompt=system_prompt,
@@ -458,12 +400,10 @@ def operation_gemini_evaluate(
                 input_data=input_data,
                 api_key=gemini_api_key
             )
-            print(evaluation)
             # Update the dataframe
             review_checklist_df.at[idx, 'Followed'] = evaluation['followed']
             review_checklist_df.at[idx, 'LLM Comments'] = evaluation['comment']
 
-            print(f"[llm] Row {idx}: {evaluation['followed']} - {evaluation['comment'][:50]}...")
             # Rate limiting - be polite to the API
             time.sleep(1)
 
@@ -477,8 +417,7 @@ def operation_gemini_evaluate(
                 row = review_checklist_df.loc[idx]
                 system_prompt = str(row.get('System Prompt', ''))
                 checkpoint_text = f"Topic: {row.get('Topics', '')}\nCheckpoint: {row.get('CheckPoints', '')}"
-                input_field = str(row.get('Input', '')).strip()
-
+                print(f"[llm] Evaluating for {checkpoint_text}")
                 input_data = {}  # <- IMPORTANT: We now store MULTIPLE data sources
 
                 # Parse input_cumulative safely
@@ -584,8 +523,6 @@ COMMENT: [Brief explanation of your evaluation in 1-2 sentences]
 Important point to consider : 
 The provided Input/Evidence can be text or drive link or combination of multiple values so evaluate accordingly
 """
-
-        print(f"Calling with prompt length: {len(evaluation_prompt)} characters")
 
         nl_data = {
             'contents': [{
@@ -749,9 +686,11 @@ def orchestrate(args):
         "llm": llm_result,
     }
     input_folder = project_root / "input" / str(args.task_id)
+    output_folder = project_root / "input" / str(args.task_id)
     batches_folder = project_root / "batches"
     configuration.delete_folder(input_folder)
     configuration.delete_folder(batches_folder)
+    print(f"Execution Results : '{output_folder}'")
     return summary
 
 

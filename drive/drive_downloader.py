@@ -836,7 +836,7 @@ class GoogleDriveDownloader:
                         elif 'accounts.google.com' in current_url:
                             if attempt < max_verification_attempts - 1:
                                 print(f"⏳ Still on login page... (attempt {attempt + 1}/{max_verification_attempts})")
-                                time.sleep(6)
+                                time.sleep(30)
                                 # Try clicking through any prompts
                                 try:
                                     # Look for "Continue" or "Next" buttons
