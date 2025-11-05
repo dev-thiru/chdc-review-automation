@@ -506,12 +506,12 @@ class GoogleDriveDownloader:
         try:
             print(f"📦 Downloading folder as ZIP using browser...")
 
-            # First, try backend method for small folders
-            if self._try_backend_folder_download(folder_id, output_path):
-                return True
+            # # First, try backend method for small folders
+            # if self._try_backend_folder_download(folder_id, output_path):
+            #     return True
 
             # If backend fails, use browser automation
-            print("🌐 Backend download failed - using browser automation...")
+            # print("🌐 Backend download failed - using browser automation...")
             return self._download_folder_with_browser(folder_id, output_path)
 
         except Exception as e:
