@@ -147,8 +147,6 @@ def delete_folder(folder_path):
     folder_path = Path(folder_path)  # Ensure it's a Path object
     if folder_path.exists() and folder_path.is_dir():
         shutil.rmtree(folder_path)
-        print(f"Folder '{folder_path}' has been deleted successfully.")
         return True
     else:
-        print(f"Folder '{folder_path}' does not exist.")
         return False
