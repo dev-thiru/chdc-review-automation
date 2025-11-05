@@ -342,11 +342,12 @@ def operation_gemini_evaluate(
 
             query_point_2 = input_df.iloc[0].get("QP2 - Query Point".strip())
             query_point_3 = input_df.iloc[0].get("QP3 - Query Point".strip())
-            if query_point_2 in ("N/A", "", "nan", None) and idx >= 71:
-                continue
 
-            if query_point_3 in ("N/A", "", "nan", None) and idx >= 111:
-                continue
+            if (pd.isna(query_point_2) or query_point_2 in ("N/A", "")) and idx >= 71:
+                break
+
+            if (pd.isna(query_point_3) or query_point_3 in ("N/A", "")) and idx >= 111:
+                break
 
             # Extract checkpoint information
             topic = str(row.get('Topics', '')) if not pd.isna(row.get('Topics')) else ''
